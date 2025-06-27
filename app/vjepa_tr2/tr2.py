@@ -164,28 +164,32 @@ def _poses_to_diffs(poses):
     return diffs
 
 def _convert_actions(raw_actions, abs_action, rotation_transformer):
-    actions = raw_actions
-    if abs_action:
-        is_dual_arm = False
-        if raw_actions.shape[-1] == 14:
-            # dual arm
-            raw_actions = raw_actions.reshape(-1,2,7)
-            is_dual_arm = True
-
-        pos = raw_actions[...,:3]
-        rot = raw_actions[...,3:6]/ 180 * np.pi
-        gripper = raw_actions[...,6:]
-        rot = rotation_transformer.forward(rot)
-        raw_actions = np.concatenate([
-            pos, rot, gripper
-        ], axis=-1).astype(np.float32)
     
-        if is_dual_arm:
-            raw_actions = raw_actions.reshape(-1,20)
-        actions = raw_actions
-    else:
+    if abs_action == False:
         # relative action
-        actions = _poses_to_diffs(raw_actions)
+        raw_actions = _poses_to_diffs(raw_actions)
+
+    is_dual_arm = False
+    if raw_actions.shape[-1] == 14:
+        # dual arm
+        raw_actions = raw_actions.reshape(-1,2,7)
+        is_dual_arm = True
+
+    pos = raw_actions[...,:3]
+    rot = raw_actions[...,3:6]/ 180 * np.pi
+    gripper = raw_actions[...,6:]
+    rot_6d = rotation_transformer.forward(rot)
+    b_this_data = rotation_transformer.inverse(rot_6d)
+    delta = b_this_data - rot
+    assert delta.sum() < 1e-6 ,"actionrot_euler transform failed"
+
+    raw_actions = np.concatenate([
+        pos, rot_6d, gripper
+    ], axis=-1).astype(np.float32)
+    
+    if is_dual_arm:
+        raw_actions = raw_actions.reshape(-1,20)
+    actions = raw_actions
         
     return actions
 
@@ -273,12 +277,17 @@ def _convert_zcai_to_replay(store, camera_views, dataset_path, abs_action, rotat
         if abs_action == True:
             all_action.append(action.astype(np.float32))
         else:
-            all_action.append(np.concatenate([
-                _poses_to_diffs(raw_state)[:1],
-                action
-            ], axis=0).astype(np.float32))
+            state_diff = _poses_to_diffs(raw_state)
+            state_diff_6d = _convert_actions(
+                raw_actions=state_diff,
+                abs_action=abs_action,
+                rotation_transformer=rotation_transformer
+            )
+
+            all_action.append(np.concatenate([state_diff_6d[:1],
+                            action], axis=0).astype(np.float32))
         
-    dara_arr = data_group.create_dataset(
+    data_arr = data_group.create_dataset(
                 name="observation.state",
                 shape=(n_steps,all_state[0].shape[1]),
                 chunks=(1,all_state[0].shape[1]),
@@ -287,7 +296,7 @@ def _convert_zcai_to_replay(store, camera_views, dataset_path, abs_action, rotat
             )
     this_data = np.concatenate(all_state, axis=0)
     assert this_data.shape[0]==n_steps, "state data length mismatch"
-    dara_arr[:] = np.concatenate(all_state, axis=0)
+    data_arr[:] = np.concatenate(all_state, axis=0)
     action_zrr = data_group.create_dataset(
                 name="action",
                 shape=(n_steps,all_action[0].shape[1]),
