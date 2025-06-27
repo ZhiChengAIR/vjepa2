@@ -203,7 +203,8 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=20,
+        action_embed_dim=14,
+        state_embed_dim=20,
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
@@ -393,7 +394,7 @@ def main(args, resume_preempt=False):
                 clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
                 states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+                extrinsics = None
                 return (clips, actions, states, extrinsics)
 
             clips, actions, states, extrinsics = load_clips()
@@ -426,13 +427,13 @@ def main(args, resume_preempt=False):
                         return _z
 
                     # -- one step of predictor with teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
+                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
                     z_tf = _step_predictor(_z, _a, _s, _e)
 
                     # -- full auto-regressive rollouts of predictor
                     _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, tokens_per_frame : 2 * tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
-                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
+                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
                         _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
                     z_ar = _z[:, tokens_per_frame:]
