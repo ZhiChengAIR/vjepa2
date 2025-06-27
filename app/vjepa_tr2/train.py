@@ -57,21 +57,24 @@ def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
 
     # -- META
-    folder = args.get("folder")
-    cfgs_meta = args.get("meta")
-    r_file = cfgs_meta.get("resume_checkpoint", None)
-    p_file = cfgs_meta.get("pretrain_checkpoint", None)
-    load_predictor = cfgs_meta.get("load_predictor", False)
-    context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")
-    target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")
-    load_encoder = cfgs_meta.get("load_encoder", True)
-    seed = cfgs_meta.get("seed", _GLOBAL_SEED)
-    save_every_freq = cfgs_meta.get("save_every_freq", -1)
-    skip_batches = cfgs_meta.get("skip_batches", -1)
-    use_sdpa = cfgs_meta.get("use_sdpa", False)
-    sync_gc = cfgs_meta.get("sync_gc", False)
-    which_dtype = cfgs_meta.get("dtype")
+    # -- META: 元数据配置
+    folder = args.get("folder")  # 保存模型的文件夹路径
+    cfgs_meta = args.get("meta")  # 获取元配置
+    r_file = cfgs_meta.get("resume_checkpoint", None)  # 恢复训练检查点文件
+    p_file = cfgs_meta.get("pretrain_checkpoint", None)  # 预训练检查点文件
+    load_predictor = cfgs_meta.get("load_predictor", False)  # 是否加载预测器
+    context_encoder_key = cfgs_meta.get("context_encoder_key", "encoder")  # 上下文编码器键名
+    target_encoder_key = cfgs_meta.get("target_encoder_key", "target_encoder")  # 目标编码器键名
+    load_encoder = cfgs_meta.get("load_encoder", True)  # 是否加载编码器
+    seed = cfgs_meta.get("seed", _GLOBAL_SEED)  # 随机种子
+    save_every_freq = cfgs_meta.get("save_every_freq", -1)  # 保存频率
+    skip_batches = cfgs_meta.get("skip_batches", -1)  # 跳过的批次数量
+    use_sdpa = cfgs_meta.get("use_sdpa", False)  # 是否使用SDPA
+    sync_gc = cfgs_meta.get("sync_gc", False)  # 是否同步垃圾回收
+    which_dtype = cfgs_meta.get("dtype")  # 数据类型
     logger.info(f"{which_dtype=}")
+
+    # 根据配置设置数据类型和混合精度
     if which_dtype.lower() == "bfloat16":
         dtype = torch.bfloat16
         mixed_precision = True
@@ -82,74 +85,74 @@ def main(args, resume_preempt=False):
         dtype = torch.float32
         mixed_precision = False
 
-    # -- MODEL
+    # -- MODEL: 模型配置
     cfgs_model = args.get("model")
-    compile_model = cfgs_model.get("compile_model", False)
-    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
-    model_name = cfgs_model.get("model_name")
-    pred_depth = cfgs_model.get("pred_depth")
-    pred_num_heads = cfgs_model.get("pred_num_heads", None)
-    pred_embed_dim = cfgs_model.get("pred_embed_dim")
-    pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True)
-    uniform_power = cfgs_model.get("uniform_power", False)
-    use_rope = cfgs_model.get("use_rope", False)
-    use_silu = cfgs_model.get("use_silu", False)
-    use_pred_silu = cfgs_model.get("use_pred_silu", False)
-    wide_silu = cfgs_model.get("wide_silu", True)
-    use_extrinsics = cfgs_model.get("use_extrinsics", False)
-
-    # -- DATA
+    compile_model = cfgs_model.get("compile_model", False)  # 是否编译模型
+    use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)  # 是否使用激活检查点
+    model_name = cfgs_model.get("model_name")  # 模型名称
+    pred_depth = cfgs_model.get("pred_depth")  # 预测器深度
+    pred_num_heads = cfgs_model.get("pred_num_heads", None)  # 预测器头数
+    pred_embed_dim = cfgs_model.get("pred_embed_dim")  # 预测器嵌入维度
+    pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True)  # 预测器是否帧因果
+    uniform_power = cfgs_model.get("uniform_power", False)  # 是否均匀功率
+    use_rope = cfgs_model.get("use_rope", False)  # 是否使用RoPE
+    use_silu = cfgs_model.get("use_silu", False)  # 是否使用SiLU激活
+    use_pred_silu = cfgs_model.get("use_pred_silu", False)  # 预测器是否使用SiLU
+    wide_silu = cfgs_model.get("wide_silu", True)  # 是否使用宽SiLU
+    use_extrinsics = cfgs_model.get("use_extrinsics", False)  # 是否使用外部参数
+  # -- DATA: 数据配置
     cfgs_data = args.get("data")
-    datasets = cfgs_data.get("datasets", [])
-    dataset_path = datasets[0]
-    dataset_fpcs = cfgs_data.get("dataset_fpcs")
-    max_num_frames = max(dataset_fpcs)
-    camera_frame = cfgs_data.get("camera_frame", False)
-    camera_views = cfgs_data.get("camera_views", ["left_mp4_path"])
-    stereo_view = cfgs_data.get("stereo_view", False)
-    batch_size = cfgs_data.get("batch_size")
-    tubelet_size = cfgs_data.get("tubelet_size")
-    fps = cfgs_data.get("fps")
-    crop_size = cfgs_data.get("crop_size", 256)
-    patch_size = cfgs_data.get("patch_size")
-    pin_mem = cfgs_data.get("pin_mem", False)
-    num_workers = cfgs_data.get("num_workers", 1)
-    persistent_workers = cfgs_data.get("persistent_workers", True)
+    datasets = cfgs_data.get("datasets", [])  # 数据集列表
+    dataset_path = datasets[0]  # 数据集路径
+    dataset_fpcs = cfgs_data.get("dataset_fpcs")  # 每段视频的帧数
+    max_num_frames = max(dataset_fpcs)  # 最大帧数
+    camera_frame = cfgs_data.get("camera_frame", False)  # 是否使用相机坐标系
+    camera_views = cfgs_data.get("camera_views", ["left_mp4_path"])  # 相机视角
+    stereo_view = cfgs_data.get("stereo_view", False)  # 是否立体视图
+    batch_size = cfgs_data.get("batch_size")  # 批次大小
+    tubelet_size = cfgs_data.get("tubelet_size")  # 管状体大小
+    fps = cfgs_data.get("fps")  # 帧率
+    crop_size = cfgs_data.get("crop_size", 256)  # 裁剪尺寸
+    patch_size = cfgs_data.get("patch_size")  # 补丁大小
+    pin_mem = cfgs_data.get("pin_mem", False)  # 是否固定内存
+    num_workers = cfgs_data.get("num_workers", 1)  # 数据加载工作线程数
+    persistent_workers = cfgs_data.get("persistent_workers", True)  # 是否保持工作线程
 
-    # -- DATA AUGS
+    # -- DATA AUGS: 数据增强配置
     cfgs_data_aug = args.get("data_aug")
-    horizontal_flip = cfgs_data_aug.get("horizontal_flip", False)
-    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
-    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
-    motion_shift = cfgs_data_aug.get("motion_shift", False)
-    reprob = cfgs_data_aug.get("reprob", 0.0)
-    use_aa = cfgs_data_aug.get("auto_augment", False)
+    horizontal_flip = cfgs_data_aug.get("horizontal_flip", False)  # 水平翻转
+    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])  # 随机调整宽高比范围
+    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])  # 随机调整比例范围
+    motion_shift = cfgs_data_aug.get("motion_shift", False)  # 运动偏移
+    reprob = cfgs_data_aug.get("reprob", 0.0)  # 随机擦除概率
+    use_aa = cfgs_data_aug.get("auto_augment", False)  # 自动增强
 
-    # -- LOSS
+    # -- LOSS: 损失函数配置
     cfgs_loss = args.get("loss")
-    loss_exp = cfgs_loss.get("loss_exp")
-    normalize_reps = cfgs_loss.get("normalize_reps")
-    auto_steps = min(cfgs_loss.get("auto_steps", 1), max_num_frames)
+    loss_exp = cfgs_loss.get("loss_exp")  # 损失指数
+    normalize_reps = cfgs_loss.get("normalize_reps")  # 是否归一化表示
+    auto_steps = min(cfgs_loss.get("auto_steps", 1), max_num_frames)  # 自动步数
     # --
-    tokens_per_frame = int((crop_size // patch_size) ** 2)
+    tokens_per_frame = int((crop_size // patch_size) ** 2)  # 每帧的token数量
 
-    # -- OPTIMIZATION
+    # -- OPTIMIZATION: 优化配置
     cfgs_opt = args.get("optimization")
-    ipe = cfgs_opt.get("ipe", None)
-    wd = float(cfgs_opt.get("weight_decay"))
-    final_wd = float(cfgs_opt.get("final_weight_decay"))
-    num_epochs = cfgs_opt.get("epochs")
-    anneal = cfgs_opt.get("anneal")
-    warmup = cfgs_opt.get("warmup")
-    start_lr = cfgs_opt.get("start_lr")
-    lr = cfgs_opt.get("lr")
-    final_lr = cfgs_opt.get("final_lr")
-    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)
-    betas = cfgs_opt.get("betas", (0.9, 0.999))
-    eps = cfgs_opt.get("eps", 1.0e-8)
+    ipe = cfgs_opt.get("ipe", None)  # 每epoch迭代次数
+    wd = float(cfgs_opt.get("weight_decay"))  # 权重衰减
+    final_wd = float(cfgs_opt.get("final_weight_decay"))  # 最终权重衰减
+    num_epochs = cfgs_opt.get("epochs")  # 总epoch数
+    anneal = cfgs_opt.get("anneal")  # 退火策略
+    warmup = cfgs_opt.get("warmup")  # 预热步数
+    start_lr = cfgs_opt.get("start_lr")  # 初始学习率
+    lr = cfgs_opt.get("lr")  # 学习率
+    final_lr = cfgs_opt.get("final_lr")  # 最终学习率
+    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)  # 编码器学习率缩放
+    betas = cfgs_opt.get("betas", (0.9, 0.999))  # Adam优化器参数
+    eps = cfgs_opt.get("eps", 1.0e-8)  # Adam优化器参数
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
+    # 设置随机种子
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.backends.cudnn.benchmark = True
@@ -200,7 +203,7 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=7,
+        action_embed_dim=20,
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,

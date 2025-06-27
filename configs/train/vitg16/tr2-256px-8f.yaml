@@ -11,7 +11,7 @@ data:
   - cam_low_image
   - cam_left_wrist_image
   - cam_right_wrist_image
-  crop_size: 256
+  crop_size: 240
   datasets:
     - /home/h666/code/model_platform/vjepa2/datasets/pick_and_place_test/raw
   dataset_fpcs:

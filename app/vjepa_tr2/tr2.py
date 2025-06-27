@@ -472,12 +472,14 @@ class TR2VideoDataset(torch.utils.data.Dataset):
         ef = np.random.randint(self.clip_nframes + self.episode_starts[index], self.episode_ends[index])
         sf = ef - self.clip_nframes
         indices = np.arange(sf, ef, dtype=np.int64)
-        states = self.replay_buffer.data["observation.state"][indices]
-        actions = self.replay_buffer.data["action"][indices][:-1]
-        extrinsics = None
+        states = self.replay_buffer.data["observation.state"][indices][:: self.frameskip]
+        actions = self.replay_buffer.data["action"][indices][:-1][:: self.frameskip]
 
         camera_view = self.camera_views[torch.randint(0, len(self.camera_views), (1,))]  
-        buffer = self.replay_buffer.data[camera_view][indices]
+        buffer = self.replay_buffer.data[camera_view][indices][:: self.frameskip]
+        # 添加transform
+        if self.image_transform is not None:
+            buffer = self.image_transform(buffer)
 
         return buffer, actions, states
 
