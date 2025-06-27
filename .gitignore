@@ -1,6 +1,7 @@
 *.pyc
 .vscode/
 .*.swp
+*.log
 
 /build
 /outputs
