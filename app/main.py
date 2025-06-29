@@ -9,6 +9,7 @@ import pprint
 from pathlib import Path
 
 import yaml
+from datetime import datetime
 
 from app.scaffold import main as app_main
 from src.utils.distributed import init_distributed
@@ -31,6 +32,11 @@ parser.add_argument(
     debug with checkpointing.",
 )
 
+def parse_dynamic_time(config, now, task_name):
+    config['folder'] = config['folder'].replace('${now:%Y.%m.%d}', now.strftime('%Y.%m.%d'))
+    config['folder'] = config['folder'].replace('${now:%H.%M.%S}', now.strftime('%H.%M.%S'))
+    config['folder'] = config['folder'].replace('${task_name}', task_name)
+    return config
 
 def process_main(rank, fname, world_size, devices):
     import os
@@ -54,6 +60,7 @@ def process_main(rank, fname, world_size, devices):
     with open(fname, "r") as y_file:
         params = yaml.load(y_file, Loader=yaml.FullLoader)
         logger.info("loaded params...")
+    params = parse_dynamic_time(params, datetime.now(), params["task_name"])
 
     # Log config
     if rank == 0:
