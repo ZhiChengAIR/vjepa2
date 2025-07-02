@@ -21,6 +21,7 @@ import copy
 import gc
 import random
 import time
+import tqdm
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from app.vjepa_tr2.utils import init_opt, init_video_model, load_checkpoint, loa
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.utils.swanlab_keeper import SwanlabKeeper
+from src.utils.world_model_wrapper import WorldModel
 
 # --
 log_timings = True
@@ -73,6 +75,8 @@ def main(args, resume_preempt=False):
     use_sdpa = cfgs_meta.get("use_sdpa", False)  # 是否使用SDPA
     sync_gc = cfgs_meta.get("sync_gc", False)  # 是否同步垃圾回收
     which_dtype = cfgs_meta.get("dtype")  # 数据类型
+    val_every_freq = cfgs_meta.get("val_every_freq", 1)  # 验证频率
+    compute_action_mse_every = cfgs_meta.get("compute_action_mse_every", 1)  # 计算动作均方误差的频率
     logger.info(f"{which_dtype=}")
 
     # 根据配置设置数据类型和混合精度
@@ -118,6 +122,7 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", False)  # 是否固定内存
     num_workers = cfgs_data.get("num_workers", 1)  # 数据加载工作线程数
     persistent_workers = cfgs_data.get("persistent_workers", True)  # 是否保持工作线程
+    val_ratio = cfgs_data.get("val_ratio", 0.05)  # 验证集比例
 
     # -- DATA AUGS: 数据增强配置
     cfgs_data_aug = args.get("data_aug")
@@ -242,7 +247,7 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
-    (unsupervised_loader, unsupervised_sampler) = init_data(
+    (train_loader, val_loader, train_sampler, val_sampler, dataset) = init_data(
         data_path=dataset_path,
         batch_size=batch_size,
         frames_per_clip=max_num_frames,
@@ -258,8 +263,9 @@ def main(args, resume_preempt=False):
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
         rank=rank,
+        val_ratio=val_ratio,
     )
-    _dlen = len(unsupervised_loader)
+    _dlen = len(train_loader)
     if ipe is None:
         ipe = _dlen
     logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
@@ -299,6 +305,28 @@ def main(args, resume_preempt=False):
         load_predictor=load_predictor,
         load_encoder=load_encoder,
     )
+
+    ac_world_model = WorldModel(
+                encoder=target_encoder,
+                predictor=predictor,
+                tokens_per_frame=tokens_per_frame,
+                rotation_transformer=dataset.rotation_transformer,  
+                mpc_args={
+                    "rollout": 2,
+                    "samples": 25,
+                    "topk": 10,
+                    "cem_steps": 2,
+                    "momentum_mean_pose": 0.14,
+                    "momentum_std_pose": 0.014,
+                    "momentum_mean_rot": 0.2,
+                    "momentum_std_rot": 0.05,
+                    "momentum_mean_gripper": 0.0002,
+                    "momentum_std_gripper": 0.0001,
+                },
+                normalize_reps=True,
+                device=device,
+                app=args["app"]
+            )
 
     start_epoch = 0
     # -- load training checkpoint
@@ -343,8 +371,8 @@ def main(args, resume_preempt=False):
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
     logger.info("Initializing loader...")
-    unsupervised_sampler.set_epoch(start_epoch)
-    loader = iter(unsupervised_loader)
+    train_sampler.set_epoch(start_epoch)
+    loader = iter(train_loader)
 
     if skip_batches > 0:
         logger.info(f"Skip {skip_batches} batches")
@@ -356,12 +384,14 @@ def main(args, resume_preempt=False):
             try:
                 _ = next(loader)
             except Exception:
-                loader = iter(unsupervised_loader)
+                loader = iter(train_loader)
                 _ = next(loader)
 
     if sync_gc:
         gc.disable()
         gc.collect()
+
+
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -374,6 +404,8 @@ def main(args, resume_preempt=False):
         gpu_time_meter = AverageMeter()
         data_elapsed_time_meter = AverageMeter()
 
+        # save batch for sampling
+        train_sampling_batch = None
         for itr in range(ipe):
             itr_start_time = time.time()
 
@@ -382,11 +414,12 @@ def main(args, resume_preempt=False):
             while not iter_successful:
                 try:
                     sample = next(loader)
+                    train_sampling_batch = sample
                     iter_successful = True
                 except StopIteration:
                     logger.info("Exhausted data loaders. Refreshing...")
-                    unsupervised_sampler.set_epoch(epoch)
-                    loader = iter(unsupervised_loader)
+                    train_sampler.set_epoch(epoch)
+                    loader = iter(train_loader)
                 except Exception as e:
                     NUM_RETRIES = 5
                     if iter_retries < NUM_RETRIES:
@@ -397,59 +430,58 @@ def main(args, resume_preempt=False):
                         logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
                         raise e
 
-            def load_clips():
+            def load_clips(sample):
                 clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
                 actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
                 states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
                 extrinsics = None
                 return (clips, actions, states, extrinsics)
 
-            clips, actions, states, extrinsics = load_clips()
+            clips, actions, states, extrinsics = load_clips(sample)
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
                 logger.info("Running garbage collection...")
                 gc.collect()
 
+            def forward_target(c):
+                with torch.no_grad():
+                    c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+                    h = target_encoder(c)
+                    h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
+                    if normalize_reps:
+                        h = F.layer_norm(h, (h.size(-1),))
+                    return h
+
+            def forward_predictions(z):
+
+                def _step_predictor(_z, _a, _s, _e):
+                    _z = predictor(_z, _a, _s, _e)
+                    if normalize_reps:
+                        _z = F.layer_norm(_z, (_z.size(-1),))
+                    return _z
+
+                # -- one step of predictor with teacher forcing
+                _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
+                z_tf = _step_predictor(_z, _a, _s, _e)
+
+                # -- full auto-regressive rollouts of predictor
+                _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, tokens_per_frame : 2 * tokens_per_frame]], dim=1)
+                for n in range(1, auto_steps):
+                    _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
+                    _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
+                    _z = torch.cat([_z, _z_nxt], dim=1)
+                z_ar = _z[:, tokens_per_frame:]
+
+                return z_tf, z_ar
+
+            def loss_fn(z, h):
+                _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
+                return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
+
             def train_step():
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
-                # --
-
-                def forward_target(c):
-                    with torch.no_grad():
-                        c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-                        h = target_encoder(c)
-                        h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
-                        if normalize_reps:
-                            h = F.layer_norm(h, (h.size(-1),))
-                        return h
-
-                def forward_predictions(z):
-
-                    def _step_predictor(_z, _a, _s, _e):
-                        _z = predictor(_z, _a, _s, _e)
-                        if normalize_reps:
-                            _z = F.layer_norm(_z, (_z.size(-1),))
-                        return _z
-
-                    # -- one step of predictor with teacher forcing
-                    _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
-                    z_tf = _step_predictor(_z, _a, _s, _e)
-
-                    # -- full auto-regressive rollouts of predictor
-                    _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, tokens_per_frame : 2 * tokens_per_frame]], dim=1)
-                    for n in range(1, auto_steps):
-                        _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
-                        _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
-                        _z = torch.cat([_z, _z_nxt], dim=1)
-                    z_ar = _z[:, tokens_per_frame:]
-
-                    return z_tf, z_ar
-
-                def loss_fn(z, h):
-                    _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
-                    return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
@@ -495,6 +527,7 @@ def main(args, resume_preempt=False):
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
 
+
             # -- Logging
             def log_stats():
                 csv_logger.log(epoch, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
@@ -533,6 +566,39 @@ def main(args, resume_preempt=False):
 
             log_stats()
             assert not np.isnan(loss), "loss is nan"
+
+        # run validation
+        if (epoch % val_every_freq) == 0: 
+            with torch.no_grad():
+                val_losses = list()
+                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+
+                    with tqdm.tqdm(val_loader, desc=f"Validation epoch {epoch}", 
+                                leave=False, mininterval=1) as tepoch:
+                        for batch_idx, batch in enumerate(tepoch):
+                            clips, actions, states, extrinsics = load_clips(batch)
+                            h = forward_target(clips)
+                            z_tf, z_ar = forward_predictions(h)
+                            jloss = loss_fn(z_tf, h)
+                            sloss = loss_fn(z_ar, h)
+                            loss = jloss + sloss
+                            val_losses.append(float(loss))
+            step_log = {}
+            if  len(val_losses) > 0:
+                val_loss = torch.mean(torch.tensor(val_losses)).item()
+                # log epoch average validation loss
+                step_log['val_loss'] = val_loss
+                global_step = (epoch + 1) * ipe
+                swanlab_runner.log(global_step=global_step, step_log=step_log)
+
+        if (epoch % compute_action_mse_every) == 0:
+            with torch.no_grad():
+                # -- compute action mse
+                clips, actions, states, extrinsics = load_clips(train_sampling_batch)
+                h = ac_world_model.encode(clips)
+                for idx in range(states.size(1)-1):
+                    actions = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
+                pass
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)

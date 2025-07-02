@@ -1,6 +1,6 @@
 app: vjepa_tr2
 cpus_per_task: 12
-task_name: pick_and_place_0530_merged
+task_name: pick_and_place_test
 folder: outputs/${task_name}/${now:%Y.%m.%d}_${now:%H.%M.%S}
 mem_per_gpu: 20G
 nodes: 1
@@ -15,7 +15,7 @@ data:
   - cam_high_image
   crop_size: 240
   datasets:
-    - datasets/pick_and_place_0530_merged/raw
+    - datasets/pick_and_place_test/raw
   dataset_fpcs:
   - 8
   fps: 4
@@ -45,10 +45,12 @@ meta:
   eval_freq: 100
   resume_checkpoint: null
   load_predictor: false
-  pretrain_checkpoint: weights/vitg.pt
+  pretrain_checkpoint: /data/shared_weights/vjepa2/vitg.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
   save_every_freq: 25
+  val_every_freq: 1
+  compute_action_mse_every: 1
   seed: 239
   use_sdpa: true
 model:
