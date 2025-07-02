@@ -12,7 +12,7 @@ from math import ceil
 import h5py
 import numpy as np
 import torch
-import torch.utils.data
+from torch.utils.data import SubsetRandomSampler, DistributedSampler, DataLoader, Dataset, Subset
 from decord import VideoReader, cpu
 from scipy.spatial.transform import Rotation
 import zarr.storage
@@ -53,6 +53,7 @@ def init_data(
     transform=None,
     camera_frame=False,
     tubelet_size=2,
+    val_ratio=0.05,
 ):
     dataset = TR2VideoDataset(
         data_path=data_path,
@@ -63,15 +64,49 @@ def init_data(
         frameskip=tubelet_size,
         camera_frame=camera_frame,
     )
+# 定义训练集和验证集的索引
+    def train_val_split(dataset, val_ratio=0.2):
+        num_samples = len(dataset)
+        indices = list(range(num_samples))
+        split = int(val_ratio * num_samples)
+        
+        # 打乱索引
+        np.random.shuffle(indices)
+        
+        # 分割索引
+        train_indices, val_indices = indices[split:], indices[:split]
+        
+        return train_indices, val_indices
 
-    dist_sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True
+    # 分割数据集
+    train_indices, val_indices = train_val_split(dataset,val_ratio=val_ratio)
+
+    # 创建训练集和验证集的子集
+    train_subset = Subset(dataset, train_indices)
+    val_subset = Subset(dataset, val_indices)
+
+    # 创建分布式采样器
+    train_sampler = DistributedSampler(
+        train_subset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    val_sampler = DistributedSampler(
+        val_subset, num_replicas=world_size, rank=rank, shuffle=False
     )
 
-    data_loader = torch.utils.data.DataLoader(
+    train_data_loader = DataLoader(
         dataset,
         collate_fn=collator,
-        sampler=dist_sampler,
+        sampler=train_sampler,
+        batch_size=batch_size,
+        drop_last=drop_last,
+        pin_memory=pin_mem,
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0) and persistent_workers,
+    )
+    val_data_loader = DataLoader(
+        dataset,
+        collate_fn=collator,
+        sampler=val_sampler,
         batch_size=batch_size,
         drop_last=drop_last,
         pin_memory=pin_mem,
@@ -79,11 +114,12 @@ def init_data(
         persistent_workers=(num_workers > 0) and persistent_workers,
     )
 
-    assert len(data_loader) > 0, "data_loader is empty"
+    assert len(train_data_loader) > 0, "train_data_loader is empty"
+    assert len(val_data_loader) > 0, "val_data_loader is empty"
 
     logger.info("VideoDataset unsupervised data loader created")
 
-    return data_loader, dist_sampler
+    return train_data_loader,val_data_loader,train_sampler, val_sampler, dataset
 
 def _get_data_from_raw(raw_dir):
 
@@ -402,7 +438,7 @@ def _get_imgs_from_video(video_path, target_size=(240, 320)):
     return frames
 
 
-class TR2VideoDataset(torch.utils.data.Dataset):
+class TR2VideoDataset(Dataset):
     """Video classification dataset."""
 
     def __init__(

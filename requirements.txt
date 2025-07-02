@@ -1,7 +1,6 @@
 torch>=2
 torchvision
 tensorboard
-wandb
 iopath
 pyyaml
 numpy
@@ -26,3 +25,4 @@ jupyter
 zarr
 numcodecs==0.11.0
 imagecodecs
+swanlab

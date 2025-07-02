@@ -118,6 +118,7 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", False)  # 是否固定内存
     num_workers = cfgs_data.get("num_workers", 1)  # 数据加载工作线程数
     persistent_workers = cfgs_data.get("persistent_workers", True)  # 是否保持工作线程
+    val_ratio = cfgs_data.get("val_ratio", 0.05)  # 验证集比例
 
     # -- DATA AUGS: 数据增强配置
     cfgs_data_aug = args.get("data_aug")
@@ -242,7 +243,7 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
-    (unsupervised_loader, unsupervised_sampler) = init_data(
+    (train_loader, val_loader, train_sampler, val_sampler, dataset) = init_data(
         data_path=dataset_path,
         batch_size=batch_size,
         frames_per_clip=max_num_frames,
@@ -258,8 +259,9 @@ def main(args, resume_preempt=False):
         pin_mem=pin_mem,
         persistent_workers=persistent_workers,
         rank=rank,
+        val_ratio=val_ratio,
     )
-    _dlen = len(unsupervised_loader)
+    _dlen = len(train_loader)
     if ipe is None:
         ipe = _dlen
     logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
@@ -343,8 +345,8 @@ def main(args, resume_preempt=False):
             logger.info(f"Encountered exception when saving checkpoint: {e}")
 
     logger.info("Initializing loader...")
-    unsupervised_sampler.set_epoch(start_epoch)
-    loader = iter(unsupervised_loader)
+    train_sampler.set_epoch(start_epoch)
+    loader = iter(train_loader)
 
     if skip_batches > 0:
         logger.info(f"Skip {skip_batches} batches")
@@ -356,7 +358,7 @@ def main(args, resume_preempt=False):
             try:
                 _ = next(loader)
             except Exception:
-                loader = iter(unsupervised_loader)
+                loader = iter(train_loader)
                 _ = next(loader)
 
     if sync_gc:
@@ -385,8 +387,8 @@ def main(args, resume_preempt=False):
                     iter_successful = True
                 except StopIteration:
                     logger.info("Exhausted data loaders. Refreshing...")
-                    unsupervised_sampler.set_epoch(epoch)
-                    loader = iter(unsupervised_loader)
+                    train_sampler.set_epoch(epoch)
+                    loader = iter(train_loader)
                 except Exception as e:
                     NUM_RETRIES = 5
                     if iter_retries < NUM_RETRIES:
