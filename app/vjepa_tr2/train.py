@@ -33,6 +33,7 @@ from app.vjepa_tr2.transforms import make_transforms
 from app.vjepa_tr2.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+from src.utils.swanlab_keeper import SwanlabKeeper
 
 # --
 log_timings = True
@@ -184,12 +185,18 @@ def main(args, resume_preempt=False):
         log_file,
         ("%d", "epoch"),
         ("%d", "itr"),
+        ("%d", "step"),
         ("%.5f", "loss"),
         ("%d", "iter-time(ms)"),
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
         mode="+a",
     )
+
+    if rank == 0 :
+        swanlab_runner = SwanlabKeeper(
+            config=args
+        )
 
     # -- init model
     encoder, predictor = init_video_model(
@@ -490,7 +497,17 @@ def main(args, resume_preempt=False):
 
             # -- Logging
             def log_stats():
-                csv_logger.log(epoch + 1, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
+                csv_logger.log(epoch, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
+                global_step = epoch * ipe + itr
+                step_log = {
+                    "epoch": epoch + itr/ipe,
+                    "itr": itr,
+                    "loss": loss,
+                    "iter_elapsed_time_ms": iter_elapsed_time_ms,
+                    "gpu_etime_ms": gpu_etime_ms,
+                    "data_elapsed_time_ms": data_elapsed_time_ms,
+                }
+                swanlab_runner.log(global_step=global_step, step_log=step_log)
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
                         "[%d, %5d] loss: %.3f [%.2f, %.2f] "

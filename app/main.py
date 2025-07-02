@@ -7,6 +7,7 @@ import argparse
 import multiprocessing as mp
 import pprint
 from pathlib import Path
+import swanlab
 
 import yaml
 from datetime import datetime
@@ -36,6 +37,9 @@ def parse_dynamic_time(config, now, task_name):
     config['folder'] = config['folder'].replace('${now:%Y.%m.%d}', now.strftime('%Y.%m.%d'))
     config['folder'] = config['folder'].replace('${now:%H.%M.%S}', now.strftime('%H.%M.%S'))
     config['folder'] = config['folder'].replace('${task_name}', task_name)
+    config['logging']['run_name'] = config['logging']['run_name'].replace('${task_name}', task_name)
+    config['logging']['run_name'] = config['logging']['run_name'].replace('${now:%Y.%m.%d}', now.strftime('%m.%d'))
+    config['logging']['run_name'] = config['logging']['run_name'].replace('${now:%H.%M.%S}', now.strftime('%H.%M'))
     return config
 
 def process_main(rank, fname, world_size, devices):

@@ -1,18 +1,21 @@
 app: vjepa_tr2
 cpus_per_task: 12
 task_name: pick_and_place_0530_merged
-folder: outputs/${now:%Y.%m.%d}/${task_name}_${now:%H.%M.%S}
-mem_per_gpu: 80G
+folder: outputs/${task_name}/${now:%Y.%m.%d}_${now:%H.%M.%S}
+mem_per_gpu: 20G
 nodes: 1
 tasks_per_node: 8
+logging:
+  enable: true
+  run_name: ${task_name}_${now:%Y.%m.%d}_${now:%H.%M.%S}
 data:
-  batch_size: 32
+  val_ratio : 0.05
+  batch_size: 1
   camera_views:
   - cam_high_image
-  - cam_low_image
   crop_size: 240
   datasets:
-    - /data/TR2/zcai/pick_and_place_0530_merged/raw
+    - datasets/pick_and_place_0530_merged/raw
   dataset_fpcs:
   - 8
   fps: 4
@@ -42,7 +45,7 @@ meta:
   eval_freq: 100
   resume_checkpoint: null
   load_predictor: false
-  pretrain_checkpoint: /data/shared_weights/vjepa2/vitg.pt
+  pretrain_checkpoint: weights/vitg.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
   save_every_freq: 25
@@ -63,7 +66,6 @@ optimization:
   epochs: 315
   final_lr: 0.0
   final_weight_decay: 0.04
-  ipe: 300
   lr: 0.000425
   start_lr: 0.000075
   warmup: 15
