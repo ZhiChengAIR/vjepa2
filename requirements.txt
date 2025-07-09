@@ -26,3 +26,4 @@ zarr
 numcodecs==0.11.0
 imagecodecs
 swanlab
+matplotlib==3.9.1

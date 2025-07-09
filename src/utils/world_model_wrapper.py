@@ -12,7 +12,7 @@ class WorldModel(object):
         rotation_transformer=None,
         mpc_args={
             "rollout": 2,
-            "samples": 400,
+            "samples": 100,
             "topk": 10,
             "cem_steps": 10,
             "momentum_mean": 0.15,

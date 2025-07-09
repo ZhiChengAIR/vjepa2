@@ -36,6 +36,7 @@ from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.utils.swanlab_keeper import SwanlabKeeper
 from src.utils.world_model_wrapper import WorldModel
+from src.utils.metrics import plot_trajectory_comparison
 
 # --
 log_timings = True
@@ -312,16 +313,19 @@ def main(args, resume_preempt=False):
                 tokens_per_frame=tokens_per_frame,
                 rotation_transformer=dataset.rotation_transformer,  
                 mpc_args={
-                    "rollout": 2,
-                    "samples": 25,
+                    "rollout": 23,
+                    "samples": 10,
                     "topk": 10,
-                    "cem_steps": 2,
-                    "momentum_mean_pose": 0.14,
-                    "momentum_std_pose": 0.014,
+                    "cem_steps": 5,
+                    "momentum_mean_pose": 6,
+                    "momentum_std_pose": 1.4,
                     "momentum_mean_rot": 0.2,
                     "momentum_std_rot": 0.05,
                     "momentum_mean_gripper": 0.0002,
                     "momentum_std_gripper": 0.0001,
+                    "max_pose": 30,
+                    "max_rot": 1,
+                    "max_gripper": 0.007,
                 },
                 normalize_reps=True,
                 device=device,
@@ -595,10 +599,36 @@ def main(args, resume_preempt=False):
             with torch.no_grad():
                 # -- compute action mse
                 clips, actions, states, extrinsics = load_clips(train_sampling_batch)
+                actions = actions.cpu().numpy().squeeze(0)
                 h = ac_world_model.encode(clips)
-                for idx in range(states.size(1)-1):
-                    actions = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
-                pass
+                idx = 0
+                pred_actions = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
+                mse = np.mean((actions - pred_actions) ** 2)
+                
+                # plot left
+                title = f"Epoch{epoch}_left-action_mse:{mse:.4f}"
+                fig = plot_trajectory_comparison(
+                    gt_xyz=actions[:, :3],
+                    pred_xyz=pred_actions[:, :3],
+                    title=title,
+                )
+                filename = f"{title}.png"
+                output_folder = os.path.join(folder, "plots")
+                os.makedirs(output_folder, exist_ok=True)
+                fig.savefig(os.path.join(output_folder, filename))
+
+                # plot right
+                title = f"Epoch{epoch}_right-action_mse:{mse:.4f}"
+                fig = plot_trajectory_comparison(
+                    gt_xyz=actions[:, 10:13],
+                    pred_xyz=pred_actions[:, 10:13],
+                    title=title,
+                )
+                filename = f"{title}.png"
+                fig.savefig(os.path.join(output_folder, filename))
+                global_step = (epoch + 1) * ipe
+                swanlab_runner.log(global_step=global_step, step_log={"actions_mse": mse})
+                logger.info("avg. action mse %.3f" % mse)
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
