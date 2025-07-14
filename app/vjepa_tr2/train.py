@@ -314,11 +314,11 @@ def main(args, resume_preempt=False):
                 rotation_transformer=dataset.rotation_transformer,  
                 mpc_args={
                     "rollout": 23,
-                    "samples": 10,
-                    "topk": 10,
-                    "cem_steps": 5,
-                    "momentum_mean_pose": 6,
-                    "momentum_std_pose": 1.4,
+                    "samples": 20,
+                    "topk": 2,
+                    "cem_steps": 10,
+                    "momentum_mean_pose": 0.14,
+                    "momentum_std_pose": 0.014,
                     "momentum_mean_rot": 0.2,
                     "momentum_std_rot": 0.05,
                     "momentum_mean_gripper": 0.0002,
@@ -470,7 +470,7 @@ def main(args, resume_preempt=False):
                 z_tf = _step_predictor(_z, _a, _s, _e)
 
                 # -- full auto-regressive rollouts of predictor
-                _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, tokens_per_frame : 2 * tokens_per_frame]], dim=1)
+                _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
                 for n in range(1, auto_steps):
                     _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
                     _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
