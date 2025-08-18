@@ -100,11 +100,15 @@ def cem(
     context_pose = context_pose.repeat(samples, 1, 1)  # Reshape to [S, 1, 20]
 
     # Current estimate of the mean/std of distribution over action trajectories
-    mean = torch.zeros((rollout, 4), device=context_frame.device)
+    mean = torch.zeros((rollout, 20), device=context_frame.device)
 
     std = torch.cat(
         [
             torch.ones((rollout, 3), device=context_frame.device) * max_pose,
+            torch.ones((rollout, 6), device=context_frame.device) * max_rot,
+            torch.ones((rollout, 1), device=context_frame.device) * max_gripper,
+            torch.ones((rollout, 3), device=context_frame.device) * max_pose,
+            torch.ones((rollout, 6), device=context_frame.device) * max_rot,
             torch.ones((rollout, 1), device=context_frame.device) * max_gripper
         ],
         dim=-1,
@@ -122,7 +126,11 @@ def cem(
             # -- sample new action
             action_samples = torch.randn(samples, mean.size(1), device=mean.device) * std[h] + mean[h]
             action_samples[:, :3] = torch.clip(action_samples[:, :3], min=-max_pose, max=max_pose)
-            action_samples[:, 3:] = torch.clip(action_samples[:, 3:], min=-max_gripper, max=max_gripper)
+            action_samples[:, 3:9] = torch.clip(action_samples[:, 3:9], min=-max_rot, max=max_rot)
+            action_samples[:, 9:10] = torch.clip(action_samples[:, 9:10], min=-max_gripper, max=max_gripper)
+            action_samples[:, 10:13] = torch.clip(action_samples[:, 10:13], min=-max_pose, max=max_pose)
+            action_samples[:, 13:19] = torch.clip(action_samples[:, 13:19], min=-max_rot, max=max_rot)
+            action_samples[:, 19:] = torch.clip(action_samples[:, 19:], min=-max_gripper, max=max_gripper)
             for ax in axis.keys():
                 action_samples[:, ax] = axis[ax]
 
@@ -157,6 +165,10 @@ def cem(
         mean = torch.cat(
             [
                 mean_selected_actions[..., :3] * (1.0 - momentum_mean_pose) + mean[..., :3] * momentum_mean_pose,
+                mean_selected_actions[..., 3:9] * (1.0 - momentum_mean_rot) + mean[..., 3:9] * momentum_mean_rot,
+                mean_selected_actions[..., 9:10] * (1.0 - momentum_mean_gripper)+ mean[..., 9:10] * momentum_mean_gripper,
+                mean_selected_actions[..., 10:13] * (1.0 - momentum_mean_pose) + mean[..., 10:13] * momentum_mean_pose,
+                mean_selected_actions[..., 13:19] * (1.0 - momentum_mean_rot) + mean[..., 13:19] * momentum_mean_rot,
                 mean_selected_actions[..., -1:] * (1.0 - momentum_mean_gripper) + mean[..., -1:] * momentum_mean_gripper,
             ],
             dim=-1,
@@ -164,12 +176,16 @@ def cem(
         std = torch.cat(
             [
                 std_selected_actions[..., :3] * (1.0 - momentum_std_pose) + std[..., :3] * momentum_std_pose,
+                std_selected_actions[..., 3:9] * (1.0 - momentum_std_rot) + std[..., 3:9] * momentum_std_rot,
+                std_selected_actions[..., 9:10] * (1.0 - momentum_std_gripper) + std[..., 9:10] * momentum_std_gripper,
+                std_selected_actions[..., 10:13] * (1.0 - momentum_std_pose) + std[..., 10:13] * momentum_std_pose,
+                std_selected_actions[..., 13:19] * (1.0 - momentum_std_rot) + std[..., 13:19] * momentum_std_rot,
                 std_selected_actions[..., -1:] * (1.0 - momentum_std_gripper) + std[..., -1:] * momentum_std_gripper,
             ],
             dim=-1,
         )
 
-        # logger.info(f"[{step}] new mean: {mean.sum(dim=0)} std:{std.sum(dim=0)}")
+        logger.info(f"[{step}] new mean: {mean.sum(dim=0)} std:{std.sum(dim=0)}")
 
     new_action = mean[None, :]
 
@@ -188,39 +204,39 @@ def compute_new_pose(pose, action, rotation_transformer):
     action = action[:, 0].cpu().numpy()
     # -- compute delta xyz
     new_xyz_left = pose[:, :3] + action[:, :3]
-    # new_xyz_right = pose[:, 10:13] + action[:, 10:13]
+    new_xyz_right = pose[:, 10:13] + action[:, 10:13]
 
     # -- compute delta theta for left arm
-    # thetas_left_6d = pose[:, 3:9]
-    # thetas_left = rotation_transformer.inverse(thetas_left_6d)
-    # delta_thetas_left_6d = action[:, 3:9]
-    # delta_thetas_left = rotation_transformer.inverse(delta_thetas_left_6d)
-    # matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas_left]
-    # delta_matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in delta_thetas_left]
-    # new_angle_left = [delta_matrices[t] @ matrices[t] for t in range(len(matrices))]
-    # new_angle_left = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in new_angle_left]
-    # new_angle_left = np.stack([d for d in new_angle_left], axis=0)
-    # new_angle_left = rotation_transformer.forward(new_angle_left)
+    thetas_left_6d = pose[:, 3:9]
+    thetas_left = rotation_transformer.inverse(thetas_left_6d)
+    delta_thetas_left_6d = action[:, 3:9]
+    delta_thetas_left = rotation_transformer.inverse(delta_thetas_left_6d)
+    matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas_left]
+    delta_matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in delta_thetas_left]
+    new_angle_left = [delta_matrices[t] @ matrices[t] for t in range(len(matrices))]
+    new_angle_left = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in new_angle_left]
+    new_angle_left = np.stack([d for d in new_angle_left], axis=0)
+    new_angle_left = rotation_transformer.forward(new_angle_left)
 
 
     # -- compute delta theta for right arm
-    # thetas_right_6d = pose[:, 13:19]
-    # thetas_right = rotation_transformer.inverse(thetas_right_6d)
-    # delta_thetas_right_6d = action[:, 13:19]
-    # delta_thetas_right = rotation_transformer.inverse(delta_thetas_right_6d) 
-    # matrices_right = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas_right]
-    # delta_matrices_right = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in delta_thetas_right]
-    # new_angle_right = [delta_matrices_right[t] @ matrices_right[t] for t in range(len(matrices_right))]
-    # new_angle_right = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in new_angle_right]
-    # new_angle_right = np.stack([d for d in new_angle_right], axis=0)
-    # new_angle_right = rotation_transformer.forward(new_angle_right)
+    thetas_right_6d = pose[:, 13:19]
+    thetas_right = rotation_transformer.inverse(thetas_right_6d)
+    delta_thetas_right_6d = action[:, 13:19]
+    delta_thetas_right = rotation_transformer.inverse(delta_thetas_right_6d) 
+    matrices_right = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas_right]
+    delta_matrices_right = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in delta_thetas_right]
+    new_angle_right = [delta_matrices_right[t] @ matrices_right[t] for t in range(len(matrices_right))]
+    new_angle_right = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in new_angle_right]
+    new_angle_right = np.stack([d for d in new_angle_right], axis=0)
+    new_angle_right = rotation_transformer.forward(new_angle_right)
 
     # -- compute delta gripper
-    gripper_left = pose[:, 3:] + action[:, 3:]
+    gripper_left = pose[:, 9:10] + action[:, 9:10]
     gripper_left = np.clip(gripper_left, 0, 1)
-    # gripper_right = pose[:, 19:] + action[:, 19:]
-    # gripper_right = np.clip(gripper_right, 0, 1)
+    gripper_right = pose[:, 19:] + action[:, 19:]
+    gripper_right = np.clip(gripper_right, 0, 1)
 
     # -- new pose
-    new_pose = np.concatenate([new_xyz_left, gripper_left], axis=-1)
+    new_pose = np.concatenate([new_xyz_left, new_angle_left, gripper_left, new_xyz_right, new_angle_right, gripper_right], axis=-1)
     return torch.from_numpy(new_pose).to(device).to(dtype)[:, None]

@@ -2,8 +2,9 @@ app: vjepa_tr2
 eval_name: vjepa_tr2
 cpus_per_task: 12
 task_name: pick_and_place_0530_merged
+# task_name: pick_and_place_test
 # folder: outputs/${task_name}/${now:%Y.%m.%d}_${now:%H.%M.%S}
-folder: outputs/pick_and_place_0530_merged/2025.07.09_18.46.30
+folder: outputs/pick_and_place_0530_merged/2025.07.19_15.18.11
 mem_per_gpu: 20G
 nodes: 1
 tasks_per_node: 8
@@ -17,7 +18,8 @@ data:
   - cam_high_image
   crop_size: 240
   datasets:
-    - /data/TR2/zcai/pick_and_place_0530_merged/raw
+    # - /data/TR2/zcai/pick_and_place_test/raw
+    - /data/TR2/zcai/pick_and_place_0530_merged_f4/raw
   dataset_fpcs:
   - 8
   fps: 4

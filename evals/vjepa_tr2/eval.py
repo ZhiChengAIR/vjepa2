@@ -55,13 +55,14 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__, force=True)
 
 
-def main(args, resume_preempt=False):
+def main(args_eval, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
 
     # -- META
     # -- META: 元数据配置
+    args = args_eval
     folder = args.get("folder")  # 保存模型的文件夹路径
     cfgs_meta = args.get("meta")  # 获取元配置
     r_file = cfgs_meta.get("resume_checkpoint", None)  # 恢复训练检查点文件
@@ -199,11 +200,6 @@ def main(args, resume_preempt=False):
         mode="+a",
     )
 
-    if rank == 0 :
-        swanlab_runner = SwanlabKeeper(
-            config=args
-        )
-
     # -- init model
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
@@ -314,8 +310,8 @@ def main(args, resume_preempt=False):
                 rotation_transformer=dataset.rotation_transformer,  
                 mpc_args={
                     "rollout": 1,
-                    "samples": 100,
-                    "topk": 20,
+                    "samples": 800,
+                    "topk": 100,
                     "cem_steps": 10,
                     "momentum_mean_pose": 0.14,
                     "momentum_std_pose": 0.014,
@@ -410,236 +406,217 @@ def main(args, resume_preempt=False):
 
         # save batch for sampling
         train_sampling_batch = None
-        for itr in range(ipe):
-            itr_start_time = time.time()
+        # for itr in range(ipe):
+        #     itr_start_time = time.time()
 
-            iter_retries = 0
-            iter_successful = False
-            while not iter_successful:
-                try:
-                    sample = next(loader)
-                    train_sampling_batch = sample
-                    iter_successful = True
-                except StopIteration:
-                    logger.info("Exhausted data loaders. Refreshing...")
-                    train_sampler.set_epoch(epoch)
-                    loader = iter(train_loader)
-                except Exception as e:
-                    NUM_RETRIES = 5
-                    if iter_retries < NUM_RETRIES:
-                        logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
-                        iter_retries += 1
-                        time.sleep(5)
-                    else:
-                        logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
-                        raise e
+        #     iter_retries = 0
+        #     iter_successful = False
+        #     while not iter_successful:
+        #         try:
+        #             sample = next(loader)
+        #             train_sampling_batch = sample
+        #             iter_successful = True
+        #         except StopIteration:
+        #             logger.info("Exhausted data loaders. Refreshing...")
+        #             train_sampler.set_epoch(epoch)
+        #             loader = iter(train_loader)
+        #         except Exception as e:
+        #             NUM_RETRIES = 5
+        #             if iter_retries < NUM_RETRIES:
+        #                 logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
+        #                 iter_retries += 1
+        #                 time.sleep(5)
+        #             else:
+        #                 logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
+        #                 raise e
 
-            def load_clips(sample):
-                clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
-                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                extrinsics = None
-                return (clips, actions, states, extrinsics)
+        def load_clips(sample):
+            clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
+            actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
+            states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+            extrinsics = None
+            return (clips, actions, states, extrinsics)
 
-            clips, actions, states, extrinsics = load_clips(sample)
-            data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+        
 
-            if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
-                logger.info("Running garbage collection...")
-                gc.collect()
+        def forward_target(c):
+            with torch.no_grad():
+                c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+                h = target_encoder(c)
+                h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
+                if normalize_reps:
+                    h = F.layer_norm(h, (h.size(-1),))
+                return h
 
-            def forward_target(c):
-                with torch.no_grad():
-                    c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-                    h = target_encoder(c)
-                    h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
-                    if normalize_reps:
-                        h = F.layer_norm(h, (h.size(-1),))
-                    return h
+        def forward_predictions(z):
 
-            def forward_predictions(z):
+            def _step_predictor(_z, _a, _s, _e):
+                _z = predictor(_z, _a, _s, _e)
+                if normalize_reps:
+                    _z = F.layer_norm(_z, (_z.size(-1),))
+                return _z
 
-                def _step_predictor(_z, _a, _s, _e):
-                    _z = predictor(_z, _a, _s, _e)
-                    if normalize_reps:
-                        _z = F.layer_norm(_z, (_z.size(-1),))
-                    return _z
+            # -- one step of predictor with teacher forcing
+            _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
+            z_tf = _step_predictor(_z, _a, _s, _e)
 
-                # -- one step of predictor with teacher forcing
-                _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
-                z_tf = _step_predictor(_z, _a, _s, _e)
+            # -- full auto-regressive rollouts of predictor
+            _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
+            for n in range(1, auto_steps):
+                _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
+                _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
+                _z = torch.cat([_z, _z_nxt], dim=1)
+            z_ar = _z[:, tokens_per_frame:]
 
-                # -- full auto-regressive rollouts of predictor
-                _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
-                for n in range(1, auto_steps):
-                    _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
-                    _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
-                    _z = torch.cat([_z, _z_nxt], dim=1)
-                z_ar = _z[:, tokens_per_frame:]
+            return z_tf, z_ar
 
-                return z_tf, z_ar
+        def loss_fn(z, h):
+            _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
+            return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
-            def loss_fn(z, h):
-                _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
-                return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
+        #     def train_step():
+        #         _new_lr = scheduler.step()
+        #         _new_wd = wd_scheduler.step()
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
+        #         # Step 1. Forward
+        #         with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+        #             h = forward_target(clips)
+        #             z_tf, z_ar = forward_predictions(h)
+        #             jloss = loss_fn(z_tf, h)
+        #             sloss = loss_fn(z_ar, h)
+        #             loss = jloss + sloss
 
-                # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z_tf, z_ar = forward_predictions(h)
-                    jloss = loss_fn(z_tf, h)
-                    sloss = loss_fn(z_ar, h)
-                    loss = jloss + sloss
+        #         # Step 2. Backward & step
+        #         if mixed_precision:
+        #             scaler.scale(loss).backward()
+        #             scaler.unscale_(optimizer)
+        #         else:
+        #             loss.backward()
+        #         if mixed_precision:
+        #             scaler.step(optimizer)
+        #             scaler.update()
+        #         else:
+        #             optimizer.step()
+        #         optimizer.zero_grad()
 
-                # Step 2. Backward & step
-                if mixed_precision:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                else:
-                    loss.backward()
-                if mixed_precision:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
+        #         return (
+        #             float(loss),
+        #             float(jloss),
+        #             float(sloss),
+        #             _new_lr,
+        #             _new_wd,
+        #         )
 
-                return (
-                    float(loss),
-                    float(jloss),
-                    float(sloss),
-                    _new_lr,
-                    _new_wd,
-                )
-
-            (
-                loss,
-                jloss,
-                sloss,
-                _new_lr,
-                _new_wd,
-            ), gpu_etime_ms = gpu_timer(train_step)
-            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
-            loss_meter.update(loss)
-            jloss_meter.update(jloss)
-            sloss_meter.update(sloss)
-            iter_time_meter.update(iter_elapsed_time_ms)
-            gpu_time_meter.update(gpu_etime_ms)
-            data_elapsed_time_meter.update(data_elapsed_time_ms)
+        #     (
+        #         loss,
+        #         jloss,
+        #         sloss,
+        #         _new_lr,
+        #         _new_wd,
+        #     ), gpu_etime_ms = gpu_timer(train_step)
+        #     iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
+        #     loss_meter.update(loss)
+        #     jloss_meter.update(jloss)
+        #     sloss_meter.update(sloss)
+        #     iter_time_meter.update(iter_elapsed_time_ms)
+        #     gpu_time_meter.update(gpu_etime_ms)
+        #     data_elapsed_time_meter.update(data_elapsed_time_ms)
 
 
-            # -- Logging
-            def log_stats():
-                csv_logger.log(epoch, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
-                global_step = epoch * ipe + itr
-                step_log = {
-                    "epoch": epoch + itr/ipe,
-                    "itr": itr,
-                    "loss": loss,
-                    "iter_elapsed_time_ms": iter_elapsed_time_ms,
-                    "gpu_etime_ms": gpu_etime_ms,
-                    "data_elapsed_time_ms": data_elapsed_time_ms,
-                }
-                swanlab_runner.log(global_step=global_step, step_log=step_log)
-                if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
-                    logger.info(
-                        "[%d, %5d] loss: %.3f [%.2f, %.2f] "
-                        "[wd: %.2e] [lr: %.2e] "
-                        "[mem: %.2e] "
-                        "[iter: %.1f ms] "
-                        "[gpu: %.1f ms] "
-                        "[data: %.1f ms]"
-                        % (
-                            epoch + 1,
-                            itr,
-                            loss_meter.avg,
-                            jloss_meter.avg,
-                            sloss_meter.avg,
-                            _new_wd,
-                            _new_lr,
-                            torch.cuda.max_memory_allocated() / 1024.0**2,
-                            iter_time_meter.avg,
-                            gpu_time_meter.avg,
-                            data_elapsed_time_meter.avg,
-                        )
-                    )
+        #     # -- Logging
+        #     def log_stats():
+        #         csv_logger.log(epoch, itr, loss, iter_elapsed_time_ms, gpu_etime_ms, data_elapsed_time_ms)
+        #         global_step = epoch * ipe + itr
+        #         step_log = {
+        #             "epoch": epoch + itr/ipe,
+        #             "itr": itr,
+        #             "loss": loss,
+        #             "iter_elapsed_time_ms": iter_elapsed_time_ms,
+        #             "gpu_etime_ms": gpu_etime_ms,
+        #             "data_elapsed_time_ms": data_elapsed_time_ms,
+        #         }
+        #         swanlab_runner.log(global_step=global_step, step_log=step_log)
+        #         if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
+        #             logger.info(
+        #                 "[%d, %5d] loss: %.3f [%.2f, %.2f] "
+        #                 "[wd: %.2e] [lr: %.2e] "
+        #                 "[mem: %.2e] "
+        #                 "[iter: %.1f ms] "
+        #                 "[gpu: %.1f ms] "
+        #                 "[data: %.1f ms]"
+        #                 % (
+        #                     epoch + 1,
+        #                     itr,
+        #                     loss_meter.avg,
+        #                     jloss_meter.avg,
+        #                     sloss_meter.avg,
+        #                     _new_wd,
+        #                     _new_lr,
+        #                     torch.cuda.max_memory_allocated() / 1024.0**2,
+        #                     iter_time_meter.avg,
+        #                     gpu_time_meter.avg,
+        #                     data_elapsed_time_meter.avg,
+        #                 )
+        #             )
 
-            log_stats()
-            assert not np.isnan(loss), "loss is nan"
+        #     log_stats()
+        #     assert not np.isnan(loss), "loss is nan"
 
+
+        sample = next(loader)
+        train_sampling_batch = sample
+        clips, actions, states, extrinsics = load_clips(sample)
         # run validation
-        if (epoch % val_every_freq) == 0: 
-            with torch.no_grad():
-                val_losses = list()
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+        with torch.no_grad():
+            val_losses = list()
+            with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
 
-                    with tqdm.tqdm(val_loader, desc=f"Validation epoch {epoch}", 
-                                leave=False, mininterval=1) as tepoch:
-                        for batch_idx, batch in enumerate(tepoch):
-                            clips, actions, states, extrinsics = load_clips(batch)
-                            h = forward_target(clips)
-                            z_tf, z_ar = forward_predictions(h)
-                            jloss = loss_fn(z_tf, h)
-                            sloss = loss_fn(z_ar, h)
-                            loss = jloss + sloss
-                            val_losses.append(float(loss))
-            step_log = {}
-            if  len(val_losses) > 0:
-                val_loss = torch.mean(torch.tensor(val_losses)).item()
-                # log epoch average validation loss
-                step_log['val_loss'] = val_loss
-                global_step = (epoch + 1) * ipe
-                swanlab_runner.log(global_step=global_step, step_log=step_log)
+                with tqdm.tqdm(val_loader, desc=f"Validation epoch {epoch}", 
+                            leave=False, mininterval=1) as tepoch:
+                    for batch_idx, batch in enumerate(tepoch):
+                        clips, actions, states, extrinsics = load_clips(batch)
+                        h = forward_target(clips)
+                        z_tf, z_ar = forward_predictions(h)
+                        jloss = loss_fn(z_tf, h)
+                        sloss = loss_fn(z_ar, h)
+                        loss = jloss + sloss
+                        val_losses.append(float(loss))
 
-        if (epoch % compute_action_mse_every) == 0:
-            with torch.no_grad():
-                # -- compute action mse
-                clips, actions, states, extrinsics = load_clips(train_sampling_batch)
-                actions = actions.cpu().numpy().squeeze(0)
-                h = ac_world_model.encode(clips)
-                idx = 0
-                pred_actions = []
-                for idx in range(states.size(1)-1):
-                    pred_action = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
-                    pred_actions.append(pred_action)
-                pred_actions = np.concatenate(pred_actions, axis=0)
-                mse = np.mean((actions - pred_actions) ** 2)
-                
-                # plot left
-                title = f"Epoch{epoch}_left-action_mse:{mse:.4f}"
-                fig = plot_trajectory_comparison(
-                    gt_xyz=actions[:, :3],
-                    pred_xyz=pred_actions[:, :3],
-                    title=title,
-                )
-                filename = f"{title}.png"
-                output_folder = os.path.join(folder, "plots")
-                os.makedirs(output_folder, exist_ok=True)
-                fig.savefig(os.path.join(output_folder, filename))
 
-                # plot right
-                # title = f"Epoch{epoch}_right-action_mse:{mse:.4f}"
-                # fig = plot_trajectory_comparison(
-                #     gt_xyz=actions[:, 10:13],
-                #     pred_xyz=pred_actions[:, 10:13],
-                #     title=title,
-                # )
-                # filename = f"{title}.png"
-                # fig.savefig(os.path.join(output_folder, filename))
-                # global_step = (epoch + 1) * ipe
-                swanlab_runner.log(global_step=global_step, step_log={"actions_mse": mse})
-                logger.info("avg. action mse %.3f" % mse)
+        with torch.no_grad():
+            # -- compute action mse
+            clips, actions, states, extrinsics = load_clips(train_sampling_batch)
+            actions = actions.cpu().numpy().squeeze(0)
+            h = ac_world_model.encode(clips)
+            idx = 0
+            pred_actions = []
+            for idx in range(states.size(1)-1):
+                pred_action = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
+                pred_actions.append(pred_action)
+            pred_actions = np.concatenate(pred_actions, axis=0)
+            mse = np.mean((actions - pred_actions) ** 2)
+            
+            # plot left
+            title = f"Epoch{epoch}_left-action_mse:{mse:.4f}"
+            fig = plot_trajectory_comparison(
+                gt_xyz=actions[:, :3],
+                pred_xyz=pred_actions[:, :3],
+                title=title,
+            )
+            filename = f"{title}.png"
+            output_folder = os.path.join(folder, "plots/eval")
+            os.makedirs(output_folder, exist_ok=True)
+            fig.savefig(os.path.join(output_folder, filename))
 
-        # -- Save Checkpoint
-        logger.info("avg. loss %.3f" % loss_meter.avg)
-        # -- Save Last
-        if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
-            save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_file = f"e{epoch}.pt"
-                save_every_path = os.path.join(folder, save_every_file)
-                save_checkpoint(epoch + 1, save_every_path)
+            # plot right
+            # title = f"Epoch{epoch}_right-action_mse:{mse:.4f}"
+            # fig = plot_trajectory_comparison(
+            #     gt_xyz=actions[:, 10:13],
+            #     pred_xyz=pred_actions[:, 10:13],
+            #     title=title,
+            # )
+            # filename = f"{title}.png"
+            # fig.savefig(os.path.join(output_folder, filename))
+            # global_step = (epoch + 1) * ipe
+            # swanlab_runner.log(global_step=global_step, step_log={"actions_mse": mse})
+            logger.info("avg. action mse %.3f" % mse)

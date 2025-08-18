@@ -457,7 +457,7 @@ class TR2VideoDataset(Dataset):
         self.frames_per_clip = frames_per_clip
         self.frameskip = frameskip
         self.fps = fps
-        vfps = 10
+        vfps = 4
         fpc = self.frames_per_clip
         fps = self.fps if self.fps is not None else vfps
         fstp = ceil(vfps / fps)
@@ -520,7 +520,9 @@ class TR2VideoDataset(Dataset):
         sf = ef - self.clip_nframes
         indices = np.arange(sf, ef, dtype=np.int64)
         states = self.replay_buffer.data["observation.state"][indices][:: self.frameskip]
+        states = np.concatenate([states[:,:3],states[:,9:10]],axis=1)
         actions = self.replay_buffer.data["action"][indices][:-1][:: self.frameskip]
+        action_single=np.concatenate([actions[:,:3],actions[:,9:10]],axis=1)
 
         camera_view = self.camera_views[torch.randint(0, len(self.camera_views), (1,))]  
         buffer = self.replay_buffer.data[camera_view][indices][:: self.frameskip]
@@ -528,7 +530,7 @@ class TR2VideoDataset(Dataset):
         if self.image_transform is not None:
             buffer = self.image_transform(buffer)
 
-        return buffer, actions, states
+        return buffer, action_single, states
 
     def poses_to_diffs(self, poses):
         xyz = poses[:, :3]  # shape [T, 3]
