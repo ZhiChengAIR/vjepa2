@@ -544,7 +544,8 @@ def main(args, resume_preempt=False):
                     "gpu_etime_ms": gpu_etime_ms,
                     "data_elapsed_time_ms": data_elapsed_time_ms,
                 }
-                swanlab_runner.log(global_step=global_step, step_log=step_log)
+                if rank == 0:
+                    swanlab_runner.log(global_step=global_step, step_log=step_log)
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
                         "[%d, %5d] loss: %.3f [%.2f, %.2f] "

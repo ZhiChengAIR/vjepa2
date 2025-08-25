@@ -16,7 +16,7 @@ timestamp=$(date +%Y-%m-%d_%H-%M-%S)
 logfile="${timestamp}_train.log"
 
 # 环境变量和命令
-command='PYTHONPATH=~/project/vjepa2 python ./app/main.py --fname configs/train/vitg16/tr2-256px-8f.yaml --device cuda:7'
+command='PYTHONPATH=~/model_platform/vjepa2 python ./app/main.py --fname configs/train/vitg16/tr2-256px-8f.yaml --device cuda:0 cuda:1 cuda:2 cuda:3'
 
 # 使用nohup命令运行脚本并将输出重定向到日志文件
 nohup bash -c "$command" > "$logfile" 2>&1 &
