@@ -28,6 +28,9 @@ import cv2
 from src.utils.replay_buffer import ReplayBuffer
 from src.utils.transforms.rotation_transformer import RotationTransformer
 from src.utils.imagecodecs_numcodecs import register_codecs, Jpeg2k
+from app.dp_vjepa2.utils import array_to_stats
+from src.utils.dp_util import dict_apply,LinearNormalizer,robomimic_abs_action_only_dual_arm_normalizer_from_stat,robomimic_abs_action_only_normalizer_from_stat,normalizer_from_stat,get_identity_normalizer_from_stat,get_range_normalizer_from_stat,get_image_range_normalizer
+
 register_codecs()
 
 
@@ -44,6 +47,7 @@ def init_data(
     rank=0,
     world_size=1,
     camera_views=0,
+    vjepapa2_use_views=[],
     stereo_view=False,
     drop_last=True,
     num_workers=10,
@@ -61,6 +65,7 @@ def init_data(
         transform=transform,
         fps=fps,
         camera_views=camera_views,
+        vjepapa2_use_views=vjepapa2_use_views,
         frameskip=tubelet_size,
         camera_frame=camera_frame,
     )
@@ -447,6 +452,7 @@ class TR2VideoDataset(Dataset):
         self,
         data_path,
         camera_views=["cam_high", "cam_low","cam_left_wrist", "cam_right_wrist"],
+        vjepapa2_use_views = ["cam_high"],
         frameskip=2,
         frames_per_clip=16,
         fps=5,
@@ -457,15 +463,18 @@ class TR2VideoDataset(Dataset):
         self.frames_per_clip = frames_per_clip
         self.frameskip = frameskip
         self.fps = fps
-        vfps = 4
+        vfps = 10
+        self.vfps = vfps
         fpc = self.frames_per_clip
         fps = self.fps if self.fps is not None else vfps
         fstp = ceil(vfps / fps)
+        self.fstp = fstp
         self.clip_nframes= int(fpc * fstp)
 
         self.image_transform = transform
         self.camera_frame = camera_frame
         self.camera_views = camera_views
+        self.vjepapa2_use_views = vjepapa2_use_views
         self.episode_len = get_auto_index(data_path)
 
         replay_buffer = None
@@ -510,28 +519,9 @@ class TR2VideoDataset(Dataset):
         self.episode_ends = self.replay_buffer.meta["episode_ends"][:]
         self.episode_starts = np.insert(self.episode_ends[:-1], 0, 0)
         self.episode_lengths = self.replay_buffer.meta["episode_lengths"][:]
-
-    # 单臂维度4
-    # def __getitem__(self, index):
-    #     vlen = self.episode_lengths[index]
-    #     if vlen < self.clip_nframes:
-    #         raise ValueError(f"Video {index} is too short to extract a clip of length {self.clip_nframes}!")
-        
-    #     ef = np.random.randint(self.clip_nframes + self.episode_starts[index], self.episode_ends[index])
-    #     sf = ef - self.clip_nframes
-    #     indices = np.arange(sf, ef, dtype=np.int64)
-    #     states = self.replay_buffer.data["observation.state"][indices][:: self.frameskip]
-    #     states = np.concatenate([states[:,:3],states[:,9:10]],axis=1)
-    #     actions = self.replay_buffer.data["action"][indices][:: self.frameskip][:-1]
-    #     action_single=np.concatenate([actions[:,:3],actions[:,9:10]],axis=1)
-
-    #     camera_view = self.camera_views[torch.randint(0, len(self.camera_views), (1,))]  
-    #     buffer = self.replay_buffer.data[camera_view][indices][:: self.frameskip]
-    #     # 添加transform
-    #     if self.image_transform is not None:
-    #         buffer = self.image_transform(buffer)
-
-    #     return buffer, action_single, states
+        self.rgb_keys = ['high_image','low_image','robot_left_in_hand_image','robot_right_in_hand_image']
+        self.lowdim_keys = ['robot_left_pos','robot_left_rot_euler','robot_left_gripper',
+                            'robot_right_pos','robot_right_rot_euler','robot_right_gripper']
 
     def __getitem__(self, index):
         vlen = self.episode_lengths[index]
@@ -541,18 +531,157 @@ class TR2VideoDataset(Dataset):
         ef = np.random.randint(self.clip_nframes + self.episode_starts[index], self.episode_ends[index])
         sf = ef - self.clip_nframes
         indices = np.arange(sf, ef, dtype=np.int64)
-        states = self.replay_buffer.data["observation.state"][indices][:: self.frameskip]
-        states = np.concatenate([states[:,:3],states[:,9:10],states[:,10:13],states[:,19:20]],axis=1)
-        actions = self.replay_buffer.data["action"][indices][:: self.frameskip][:-1]
-        action_bi=np.concatenate([actions[:,:3],actions[:,9:10],actions[:,10:13],actions[:,19:20]],axis=1)
+        states = self.replay_buffer.data["observation.state"][indices][:: self.fstp]
+        states = np.concatenate([states[:,:3],states[:,9:10]],axis=1)
+        actions = self.replay_buffer.data["action"][indices][:: self.fstp][:-1]
+        dp_action = self.replay_buffer.data["action"][indices]
+        action_single=np.concatenate([actions[:,:3],actions[:,9:10]],axis=1)
 
         camera_view = self.camera_views[torch.randint(0, len(self.camera_views), (1,))]  
-        buffer = self.replay_buffer.data[camera_view][indices][:: self.frameskip]
+        imgs = self.replay_buffer.data[camera_view][indices][:: self.fstp]
+
         # 添加transform
         if self.image_transform is not None:
-            buffer = self.image_transform(buffer)
+            buffer = self.image_transform(imgs)
 
-        return buffer, action_bi, states
+        obs_dict = dict()
+        dp_data_len = self.clip_nframes // self.fstp
+
+        cache_list = []
+        # goal_images = []
+        this_data = self.replay_buffer.data['cam_high_image'][indices]
+        obs_dict["high_image"] = np.moveaxis(this_data[:2], -1, 1).astype(np.float32) / 255.
+        this_data = self.replay_buffer.data['cam_low_image'][indices]
+        obs_dict["low_image"] = np.moveaxis(this_data[:2], -1, 1).astype(np.float32) / 255.
+        this_data = self.replay_buffer.data['cam_left_wrist_image'][indices]
+        obs_dict["robot_left_in_hand_image"] = np.moveaxis(this_data[:2], -1, 1).astype(np.float32) / 255.
+        this_data = self.replay_buffer.data['cam_right_wrist_image'][indices]
+        obs_dict["robot_right_in_hand_image"] = np.moveaxis(this_data[:2], -1, 1).astype(np.float32) / 255.
+
+        # for i in range(dp_data_len):
+        #     this_image = np.moveaxis(this_data[i*self.fstp:i*self.fstp+2], -1, 1).astype(np.float32) / 255.
+        #     cache_list.append(this_image)
+        # obs_dict["high_image"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # this_data = self.replay_buffer.data['cam_low_image'][indices]
+        # for i in range(dp_data_len):
+        #     this_image = np.moveaxis(this_data[i*self.fstp:i*self.fstp+2], -1, 1).astype(np.float32) / 255.
+        #     cache_list.append(this_image)
+        # obs_dict["low_image"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # this_data = self.replay_buffer.data['cam_left_wrist_image'][indices]
+        # for i in range(dp_data_len):
+        #     this_image = np.moveaxis(this_data[i*self.fstp:i*self.fstp+2], -1, 1).astype(np.float32) / 255.
+        #     cache_list.append(this_image)
+        # obs_dict["robot_left_in_hand_image"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # this_data = self.replay_buffer.data['cam_right_wrist_image'][indices]
+        # for i in range(dp_data_len):
+        #     this_image = np.moveaxis(this_data[i*self.fstp:i*self.fstp+2], -1, 1).astype(np.float32) / 255.
+        #     cache_list.append(this_image)
+        # obs_dict["robot_right_in_hand_image"] = np.stack(cache_list[:-1], axis=0)
+
+        
+        lowdim = self.replay_buffer.data["observation.state"][indices][:2]
+        obs_dict["robot_left_pos"] = lowdim[:, :3].astype(np.float32)
+        obs_dict["robot_left_rot_euler"] = lowdim[:, 3:9].astype(np.float32)
+        obs_dict["robot_left_gripper"] = lowdim[:, 9:10].astype(np.float32)
+        obs_dict["robot_right_pos"] = lowdim[:, 10:13].astype(np.float32)
+        obs_dict["robot_right_rot_euler"] = lowdim[:, 13:19].astype(np.float32)
+        obs_dict["robot_right_gripper"] = lowdim[:, 19:20].astype(np.float32)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,:3].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_left_pos"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,3:9].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_left_rot_euler"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,9:10].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_left_gripper"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,10:13].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_right_pos"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,13:19].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_right_rot_euler"] = np.stack(cache_list[:-1], axis=0)
+
+        # cache_list = []
+        # for i in range(dp_data_len):
+        #     this_lowdim = lowdim[i*self.fstp:i*self.fstp+2,19:20].astype(np.float32)
+        #     cache_list.append(this_lowdim)
+        # obs_dict["robot_right_gripper"] = np.stack(cache_list[:-1], axis=0)
+
+        dp_torch_data = {
+            'obs': dict_apply(obs_dict, torch.from_numpy),
+            'action': torch.from_numpy(dp_action),
+        }
+
+        return buffer, action_single, states, dp_torch_data
+
+    def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        normalizer = LinearNormalizer()
+
+        # action
+        stat = array_to_stats(self.replay_buffer['action'])
+        # if self.abs_action:
+        #     if stat['mean'].shape[-1] > 10:
+        #         # dual arm
+        #         this_normalizer = robomimic_abs_action_only_dual_arm_normalizer_from_stat(stat)
+        #     else:
+        #         this_normalizer = robomimic_abs_action_only_normalizer_from_stat(stat)
+            
+        #     if self.use_legacy_normalizer:
+        #         this_normalizer = normalizer_from_stat(stat)
+        # else:
+        #     # already normalized
+        this_normalizer = get_identity_normalizer_from_stat(stat)
+        normalizer['action'] = this_normalizer
+
+        # obs
+        data = self.replay_buffer['observation.state']
+        lowdim_data = {}
+        lowdim_data['robot_left_pos'] = data[:, :3]
+        lowdim_data['robot_left_rot_euler'] = data[:, 3:9]
+        lowdim_data['robot_left_gripper'] = data[:, 9:10]
+        lowdim_data['robot_right_pos'] = data[:, 10:13]
+        lowdim_data['robot_right_rot_euler'] = data[:, 13:19]
+        lowdim_data['robot_right_gripper'] = data[:, 19:20]
+        for key in self.lowdim_keys:
+            stat = array_to_stats(lowdim_data[key])
+
+            if key.endswith('pos'):
+                this_normalizer = get_range_normalizer_from_stat(stat)
+            elif key.endswith('euler'): #tr2 
+                # quaternion is in [-1,1] already
+                this_normalizer = get_identity_normalizer_from_stat(stat)
+            elif key.endswith('gripper'): #qpos
+                this_normalizer = get_range_normalizer_from_stat(stat)
+            else:
+                raise RuntimeError('unsupported')
+            normalizer[key] = this_normalizer
+
+        # image
+        for key in self.rgb_keys:
+            normalizer[key] = get_image_range_normalizer()
+        return normalizer
 
     def poses_to_diffs(self, poses):
         xyz = poses[:, :3]  # shape [T, 3]

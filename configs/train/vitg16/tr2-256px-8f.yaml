@@ -19,7 +19,7 @@ data:
   crop_size: 240
   datasets:
     # - /data/TR2/zcai/pick_and_place_test/raw
-    - /data/TR2/zcai/pick_and_place_0530_merged_f4/raw
+    - /home/huxian/dataset/zcai/pick_and_place_0530_merged_f4/raw
   dataset_fpcs:
   - 8
   fps: 4
@@ -49,7 +49,7 @@ meta:
   eval_freq: 100
   resume_checkpoint: null
   load_predictor: false
-  pretrain_checkpoint: /data/shared_weights/vjepa2/vitg.pt
+  pretrain_checkpoint: /home/huxian/shared_weights/vjepa2/vitg.pt
   context_encoder_key: target_encoder
   target_encoder_key: target_encoder
   save_every_freq: 25

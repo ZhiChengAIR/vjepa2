@@ -1,0 +1,151 @@
+app: dp_vjepa2
+eval_name: dp_vjepa2
+cpus_per_task: 12
+# task_name: pick_and_place_0530_merged
+task_name: pick_and_place_test
+folder: outputs/${task_name}/${now:%Y.%m.%d}_${now:%H.%M.%S}
+# folder: outputs/pick_and_place_0530_merged/2025.07.19_15.18.11
+mem_per_gpu: 20G
+nodes: 1
+tasks_per_node: 8
+logging:
+  enable: true
+  run_name: ${task_name}_${now:%Y.%m.%d}_${now:%H.%M.%S}
+data:
+  val_ratio : 0.05
+  batch_size: 1
+  camera_views:
+  - cam_high_image
+  - cam_low_image
+  - cam_left_wrist_image
+  - cam_right_wrist_image
+  vejapa2_use_views:
+  - cam_high_image
+  crop_size: 240
+  datasets:
+    - /home/huxian/dataset/zcai/pick_and_place_test/raw
+    # - /home/huxian/dataset/zcai/pick_and_place_0530_merged_f4/raw
+  dataset_fpcs:
+  - 8
+  fps: 4
+  num_workers: 12
+  patch_size: 16
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 1.777
+  - 1.777
+  reprob: 0.0
+loss:
+  auto_steps: 2
+  loss_exp: 1.0
+  normalize_reps: true
+  reg_coeff: 0.0
+meta:
+  dtype: bfloat16
+  eval_freq: 100
+  resume_checkpoint: null
+  load_predictor: false
+  pretrain_checkpoint: /home/huxian/shared_weights/vjepa2/vitg.pt
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+  save_every_freq: 25
+  val_every_freq: 1
+  compute_action_mse_every: 1
+  seed: 239
+  use_sdpa: true
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_is_frame_causal: true
+  pred_num_heads: 16
+  uniform_power: true
+  use_activation_checkpointing: true
+  use_extrinsics: false
+  use_rope: true
+dp_policy:
+  shape_meta: 
+    # acceptable types: rgb, low_dim
+    obs:
+      high_image:
+        shape: [3, 240, 320] #[3, 84, 84]
+        type: rgb
+      low_image:
+        shape: [3, 240, 320] #[3, 84, 84]
+        type: rgb
+      robot_left_in_hand_image:
+        shape: [3, 240, 320] #[3, 84, 84]
+        type: rgb
+      robot_right_in_hand_image:
+        shape: [3, 240, 320] #[3, 84, 84]
+        type: rgb
+      robot_left_pos:
+        shape: [3]
+        type: low_dim
+      robot_left_rot_euler:
+        shape: [6] #rotation_6d
+        type: low_dim
+      robot_left_gripper:
+        shape: [1]
+        type: low_dim
+      robot_right_pos:
+        shape: [3]
+        type: low_dim
+      robot_right_rot_euler:
+        shape: [6] #rotation_6d
+        type: low_dim
+      robot_right_gripper:
+        shape: [1]
+        type: low_dim
+    action: 
+      shape: [20]
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    # variance_type: fixed_small # Yilun's paper uses fixed_small_log instead, but easy to cause Nan
+    clip_sample: True # required when predict_epsilon=False
+    # set_alpha_to_one: True # for ddim
+    steps_offset: 0 # for ddim
+    prediction_type: epsilon # or sample
+
+  horizon: 21
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: 2
+  num_inference_steps: 100
+
+  crop_shape: [216, 288] # ch, cw 320x240 90%
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+  n_layer: 8
+  n_cond_layers: 0  # >0: use transformer encoder for cond, otherwise use MLP
+  n_head: 4
+  n_emb: 256
+  p_drop_emb: 0.0
+  p_drop_attn: 0.3
+  causal_attn: True
+  time_as_cond: True # if false, use BERT like encoder only arch, time as input
+  obs_as_cond: ${obs_as_cond}
+  ema_action_alpha: 0.9
+  ema_action_depth: 9
+optimization:
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  epochs: 315
+optimizer:
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 1.0e-6
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.95]

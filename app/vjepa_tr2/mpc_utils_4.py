@@ -3,7 +3,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-# dim = 8
+# dim = 4
 
 import numpy as np
 import torch
@@ -101,12 +101,10 @@ def cem(
     context_pose = context_pose.repeat(samples, 1, 1)  # Reshape to [S, 1, 20]
 
     # Current estimate of the mean/std of distribution over action trajectories
-    mean = torch.zeros((rollout, 8), device=context_frame.device)
+    mean = torch.zeros((rollout, 4), device=context_frame.device)
 
     std = torch.cat(
         [
-            torch.ones((rollout, 3), device=context_frame.device) * max_pose,
-            torch.ones((rollout, 1), device=context_frame.device) * max_gripper,
             torch.ones((rollout, 3), device=context_frame.device) * max_pose,
             torch.ones((rollout, 1), device=context_frame.device) * max_gripper
         ],
@@ -125,9 +123,7 @@ def cem(
             # -- sample new action
             action_samples = torch.randn(samples, mean.size(1), device=mean.device) * std[h] + mean[h]
             action_samples[:, :3] = torch.clip(action_samples[:, :3], min=-max_pose, max=max_pose)
-            action_samples[:, 3:4] = torch.clip(action_samples[:, 3:4], min=-max_gripper, max=max_gripper)
-            action_samples[:, 4:7] = torch.clip(action_samples[:, 4:7], min=-max_pose, max=max_pose)
-            action_samples[:, 7:8] = torch.clip(action_samples[:, 7:8], min=-max_gripper, max=max_gripper)
+            action_samples[:, 3:] = torch.clip(action_samples[:, 3:], min=-max_gripper, max=max_gripper)
             for ax in axis.keys():
                 action_samples[:, ax] = axis[ax]
 
@@ -162,18 +158,14 @@ def cem(
         mean = torch.cat(
             [
                 mean_selected_actions[..., :3] * (1.0 - momentum_mean_pose) + mean[..., :3] * momentum_mean_pose,
-                mean_selected_actions[..., 3:4] * (1.0 - momentum_mean_gripper) + mean[..., 3:4] * momentum_mean_gripper,
-                mean_selected_actions[..., 4:7] * (1.0 - momentum_mean_pose) + mean[..., 4:7] * momentum_mean_pose,
-                mean_selected_actions[..., 7:8] * (1.0 - momentum_mean_gripper) + mean[..., 7:8] * momentum_mean_gripper,
+                mean_selected_actions[..., -1:] * (1.0 - momentum_mean_gripper) + mean[..., -1:] * momentum_mean_gripper,
             ],
             dim=-1,
         )
         std = torch.cat(
             [
                 std_selected_actions[..., :3] * (1.0 - momentum_std_pose) + std[..., :3] * momentum_std_pose,
-                std_selected_actions[..., 3:4] * (1.0 - momentum_std_gripper) + std[..., 3:4] * momentum_std_gripper,
-                std_selected_actions[..., 4:7] * (1.0 - momentum_std_pose) + std[..., 4:7] * momentum_std_pose,
-                std_selected_actions[..., 7:8] * (1.0 - momentum_std_gripper) + std[..., 7:8] * momentum_std_gripper,
+                std_selected_actions[..., -1:] * (1.0 - momentum_std_gripper) + std[..., -1:] * momentum_std_gripper,
             ],
             dim=-1,
         )
@@ -197,7 +189,7 @@ def compute_new_pose(pose, action, rotation_transformer):
     action = action[:, 0].cpu().numpy()
     # -- compute delta xyz
     new_xyz_left = pose[:, :3] + action[:, :3]
-    new_xyz_right = pose[:, 4:7] + action[:, 4:7]
+    # new_xyz_right = pose[:, 10:13] + action[:, 10:13]
 
     # -- compute delta theta for left arm
     # thetas_left_6d = pose[:, 3:9]
@@ -225,11 +217,11 @@ def compute_new_pose(pose, action, rotation_transformer):
     # new_angle_right = rotation_transformer.forward(new_angle_right)
 
     # -- compute delta gripper
-    gripper_left = pose[:, 3:4] + action[:, 3:4]
+    gripper_left = pose[:, 3:] + action[:, 3:]
     gripper_left = np.clip(gripper_left, 0, 1)
-    gripper_right = pose[:, 7:8] + action[:, 7:8]
-    gripper_right = np.clip(gripper_right, 0, 1)
+    # gripper_right = pose[:, 19:] + action[:, 19:]
+    # gripper_right = np.clip(gripper_right, 0, 1)
 
     # -- new pose
-    new_pose = np.concatenate([new_xyz_left, gripper_left, new_xyz_right, gripper_right], axis=-1)
+    new_pose = np.concatenate([new_xyz_left, gripper_left], axis=-1)
     return torch.from_numpy(new_pose).to(device).to(dtype)[:, None]

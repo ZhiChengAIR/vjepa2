@@ -5,8 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 #
 
-# dim=8
-
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -31,7 +29,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
-from app.vjepa_tr2.tr2 import init_data
+from app.dp_vjepa2.tr2 import init_data
 from app.vjepa_tr2.transforms import make_transforms
 from app.vjepa_tr2.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
@@ -39,6 +37,9 @@ from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from src.utils.swanlab_keeper import SwanlabKeeper
 from src.utils.world_model_wrapper import WorldModel
 from src.utils.metrics import plot_trajectory_comparison
+from src.models.diffusion_transformer_hybrid_image_policy import DiffusionTransformerHybridImagePolicy
+from src.utils.dp_util import dict_apply
+from src.models.utils.lr_scheduler import get_scheduler
 
 # --
 log_timings = True
@@ -55,6 +56,14 @@ torch.backends.cudnn.benchmark = True
 
 
 logger = get_logger(__name__, force=True)
+
+def load_clips(sample,device):
+    clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
+    actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
+    states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
+    dp_torch_data = sample[3]
+    extrinsics = None
+    return (clips, actions, states, extrinsics, dp_torch_data)
 
 
 def main(args, resume_preempt=False):
@@ -116,6 +125,7 @@ def main(args, resume_preempt=False):
     max_num_frames = max(dataset_fpcs)  # 最大帧数
     camera_frame = cfgs_data.get("camera_frame", False)  # 是否使用相机坐标系
     camera_views = cfgs_data.get("camera_views", ["left_mp4_path"])  # 相机视角
+    vjepapa2_use_views = cfgs_data.get("vejapa2_use_views", ["left_mp4_path"])  # VJepa2使用的视角
     stereo_view = cfgs_data.get("stereo_view", False)  # 是否立体视图
     batch_size = cfgs_data.get("batch_size")  # 批次大小
     tubelet_size = cfgs_data.get("tubelet_size")  # 管状体大小
@@ -146,18 +156,10 @@ def main(args, resume_preempt=False):
 
     # -- OPTIMIZATION: 优化配置
     cfgs_opt = args.get("optimization")
+    cfgs_optz = args.get("optimizer")  # 优化器
     ipe = cfgs_opt.get("ipe", None)  # 每epoch迭代次数
-    wd = float(cfgs_opt.get("weight_decay"))  # 权重衰减
-    final_wd = float(cfgs_opt.get("final_weight_decay"))  # 最终权重衰减
     num_epochs = cfgs_opt.get("epochs")  # 总epoch数
-    anneal = cfgs_opt.get("anneal")  # 退火策略
-    warmup = cfgs_opt.get("warmup")  # 预热步数
-    start_lr = cfgs_opt.get("start_lr")  # 初始学习率
-    lr = cfgs_opt.get("lr")  # 学习率
-    final_lr = cfgs_opt.get("final_lr")  # 最终学习率
-    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)  # 编码器学习率缩放
-    betas = cfgs_opt.get("betas", (0.9, 0.999))  # Adam优化器参数
-    eps = cfgs_opt.get("eps", 1.0e-8)  # Adam优化器参数
+    # lr = cfgs_opt.get("lr")  # 学习率
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
@@ -207,6 +209,7 @@ def main(args, resume_preempt=False):
         )
 
     # -- init model
+    dp_model = DiffusionTransformerHybridImagePolicy(**args.get("dp_policy"))
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
         device=device,
@@ -218,8 +221,8 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_num_heads=pred_num_heads,
         pred_embed_dim=pred_embed_dim,
-        action_embed_dim=8,
-        state_embed_dim=8,
+        action_embed_dim=4,
+        state_embed_dim=4,
         pred_is_frame_causal=pred_is_frame_causal,
         use_extrinsics=use_extrinsics,
         use_sdpa=use_sdpa,
@@ -230,6 +233,8 @@ def main(args, resume_preempt=False):
         use_activation_checkpointing=use_activation_checkpointing,
     )
     target_encoder = copy.deepcopy(encoder)
+
+    
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -257,6 +262,7 @@ def main(args, resume_preempt=False):
         tubelet_size=1,
         fps=fps,
         camera_views=camera_views,
+        vjepapa2_use_views=vjepapa2_use_views,
         camera_frame=camera_frame,
         stereo_view=stereo_view,
         transform=transform,
@@ -273,28 +279,15 @@ def main(args, resume_preempt=False):
         ipe = _dlen
     logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
 
-    # -- init optimizer and scheduler
-    optimizer, scaler, scheduler, wd_scheduler = init_opt(
-        encoder=encoder,
-        predictor=predictor,
-        wd=wd,
-        final_wd=final_wd,
-        start_lr=start_lr,
-        ref_lr=lr,
-        final_lr=final_lr,
-        enc_lr_scale=enc_lr_scale,
-        iterations_per_epoch=ipe,
-        anneal=anneal,
-        warmup=warmup,
-        num_epochs=num_epochs,
-        mixed_precision=mixed_precision,
-        betas=betas,
-        eps=eps,
-    )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
+
+
+    # encoder = DistributedDataParallel(encoder, static_graph=True)
     predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
     target_encoder = DistributedDataParallel(target_encoder)
+    # dp_model = DistributedDataParallel(dp_model, static_graph=False, find_unused_parameters=True)
     for p in target_encoder.parameters():
+        p.requires_grad = False
+    for p in predictor.parameters():
         p.requires_grad = False
 
     # -- looad pretrained weights
@@ -308,31 +301,6 @@ def main(args, resume_preempt=False):
         load_predictor=load_predictor,
         load_encoder=load_encoder,
     )
-
-    ac_world_model = WorldModel(
-                encoder=target_encoder,
-                predictor=predictor,
-                tokens_per_frame=tokens_per_frame,
-                rotation_transformer=dataset.rotation_transformer,  
-                mpc_args={
-                    "rollout": 1,
-                    "samples": 100,
-                    "topk": 20,
-                    "cem_steps": 10,
-                    "momentum_mean_pose": 0.14,
-                    "momentum_std_pose": 0.014,
-                    "momentum_mean_rot": 0.2,
-                    "momentum_std_rot": 0.05,
-                    "momentum_mean_gripper": 0.0002,
-                    "momentum_std_gripper": 0.0001,
-                    "max_pose": 40,
-                    "max_rot": 1,
-                    "max_gripper": 0.007,
-                },
-                normalize_reps=True,
-                device=device,
-                app=args["app"]
-            )
 
     start_epoch = 0
     # -- load training checkpoint
@@ -352,9 +320,23 @@ def main(args, resume_preempt=False):
             opt=optimizer,
             scaler=scaler,
         )
-        for _ in range(start_epoch * ipe):
-            scheduler.step()
-            wd_scheduler.step()
+        # for _ in range(start_epoch * ipe):
+        #     scheduler.step()
+
+    # -- init optimizer and scheduler
+    normalizer = dataset.get_normalizer()
+    dp_model.set_normalizer(normalizer)
+    optimizer = dp_model.get_optimizer(**cfgs_optz)
+    lr_scheduler = get_scheduler(
+        cfgs_opt.get("lr_scheduler"),
+        optimizer=optimizer,
+        num_warmup_steps=cfgs_opt.get("lr_warmup_steps"),
+        num_training_steps=(
+            _dlen * num_epochs),
+        # pytorch assumes stepping LRScheduler every epoch
+        # however huggingface diffusers steps it every batch
+        last_epoch=-1,
+    )
 
     def save_checkpoint(epoch, path):
         if rank != 0:
@@ -362,14 +344,15 @@ def main(args, resume_preempt=False):
         save_dict = {
             "encoder": encoder.state_dict(),
             "predictor": predictor.state_dict(),
+            "dp_model": dp_model.state_dict(),
             "opt": optimizer.state_dict(),
-            "scaler": None if scaler is None else scaler.state_dict(),
+            # "scaler": None if scaler is None else scaler.state_dict(),
             "target_encoder": target_encoder.state_dict(),
             "epoch": epoch,
             "loss": loss_meter.avg,
             "batch_size": batch_size,
             "world_size": world_size,
-            "lr": lr,
+            "lr": lr_scheduler.get_last_lr()[0],
         }
         try:
             torch.save(save_dict, path)
@@ -400,6 +383,7 @@ def main(args, resume_preempt=False):
 
 
     # -- TRAINING LOOP
+    dp_model.to(device)
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
 
@@ -436,14 +420,11 @@ def main(args, resume_preempt=False):
                         logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
                         raise e
 
-            def load_clips(sample):
-                clips = sample[0].to(device, non_blocking=True)  # [B C T H W]
-                actions = sample[1].to(device, dtype=torch.float, non_blocking=True)  # [B T-1 7]
-                states = sample[2].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
-                extrinsics = None
-                return (clips, actions, states, extrinsics)
 
-            clips, actions, states, extrinsics = load_clips(sample)
+
+            clips, actions, states, extrinsics,dp_torch_data = load_clips(sample,device)
+
+            dp_torch_data = dict_apply(dp_torch_data, lambda x: x.to(device, non_blocking=True))
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -459,7 +440,7 @@ def main(args, resume_preempt=False):
                         h = F.layer_norm(h, (h.size(-1),))
                     return h
 
-            def forward_predictions(z):
+            def forward_predictions(z,actions_dp):
 
                 def _step_predictor(_z, _a, _s, _e):
                     _z = predictor(_z, _a, _s, _e)
@@ -468,67 +449,56 @@ def main(args, resume_preempt=False):
                     return _z
 
                 # -- one step of predictor with teacher forcing
-                _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], None
+                action_single=torch.cat([actions_dp[:,:,:3],actions_dp[:,:,9:10]],axis=2)
+                _z, _a, _s, _e = z[:, :-tokens_per_frame], action_single, states[:, :-1], None
                 z_tf = _step_predictor(_z, _a, _s, _e)
 
-                # -- full auto-regressive rollouts of predictor
-                _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
-                for n in range(1, auto_steps):
-                    _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
-                    _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
-                    _z = torch.cat([_z, _z_nxt], dim=1)
-                z_ar = _z[:, tokens_per_frame:]
+                # # -- full auto-regressive rollouts of predictor
+                # _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
+                # for n in range(1, auto_steps):
+                #     _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], None
+                #     _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
+                #     _z = torch.cat([_z, _z_nxt], dim=1)
+                # z_ar = _z[:, tokens_per_frame:]
 
-                return z_tf, z_ar
+                return z_tf
 
             def loss_fn(z, h):
                 _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
                 return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
+            def train_step(fstp):
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                    dp_loss, pred_action= dp_model.compute_loss(dp_torch_data)
                     h = forward_target(clips)
-                    z_tf, z_ar = forward_predictions(h)
-                    jloss = loss_fn(z_tf, h)
-                    sloss = loss_fn(z_ar, h)
-                    loss = jloss + sloss
+                    h_pred = forward_predictions(h,pred_action[:,::fstp])
+                    vjepa_loss = loss_fn(h_pred,h)
+                    loss = vjepa_loss + dp_loss
 
                 # Step 2. Backward & step
-                if mixed_precision:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                else:
-                    loss.backward()
-                if mixed_precision:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 optimizer.zero_grad()
+                lr_scheduler.step()
 
                 return (
                     float(loss),
-                    float(jloss),
-                    float(sloss),
-                    _new_lr,
-                    _new_wd,
+                    float(dp_loss),
+                    float(vjepa_loss),
+                    lr_scheduler.get_last_lr()[0],
                 )
 
             (
                 loss,
-                jloss,
-                sloss,
+                dp_loss,
+                vjepa_loss,
                 _new_lr,
-                _new_wd,
-            ), gpu_etime_ms = gpu_timer(train_step)
+            ), gpu_etime_ms = gpu_timer(lambda: train_step(dataset.fstp))
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
-            jloss_meter.update(jloss)
-            sloss_meter.update(sloss)
+            jloss_meter.update(dp_loss)
+            sloss_meter.update(vjepa_loss)
             iter_time_meter.update(iter_elapsed_time_ms)
             gpu_time_meter.update(gpu_etime_ms)
             data_elapsed_time_meter.update(data_elapsed_time_ms)
@@ -551,7 +521,7 @@ def main(args, resume_preempt=False):
                 if (itr % log_freq == 0) or (itr == ipe - 1) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
                         "[%d, %5d] loss: %.3f [%.2f, %.2f] "
-                        "[wd: %.2e] [lr: %.2e] "
+                        "[lr: %.2e] "
                         "[mem: %.2e] "
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
@@ -562,7 +532,6 @@ def main(args, resume_preempt=False):
                             loss_meter.avg,
                             jloss_meter.avg,
                             sloss_meter.avg,
-                            _new_wd,
                             _new_lr,
                             torch.cuda.max_memory_allocated() / 1024.0**2,
                             iter_time_meter.avg,
@@ -583,59 +552,59 @@ def main(args, resume_preempt=False):
                     with tqdm.tqdm(val_loader, desc=f"Validation epoch {epoch}", 
                                 leave=False, mininterval=1) as tepoch:
                         for batch_idx, batch in enumerate(tepoch):
-                            clips, actions, states, extrinsics = load_clips(batch)
+                            clips, actions, states, extrinsics, dp_torch_data = load_clips(batch, device)
+                            dp_loss, pred_action= dp_model.compute_loss(dp_torch_data)
                             h = forward_target(clips)
-                            z_tf, z_ar = forward_predictions(h)
-                            jloss = loss_fn(z_tf, h)
-                            sloss = loss_fn(z_ar, h)
-                            loss = jloss + sloss
+                            h_pred = forward_predictions(h,pred_action[:,::dataset.fstp])
+                            vjepa_loss = loss_fn(h_pred,h)
+                            loss = vjepa_loss + dp_loss
                             val_losses.append(float(loss))
             step_log = {}
-            if  len(val_losses) > 0 and rank == 0:
+            if  len(val_losses) > 0:
                 val_loss = torch.mean(torch.tensor(val_losses)).item()
                 # log epoch average validation loss
                 step_log['val_loss'] = val_loss
                 global_step = (epoch + 1) * ipe
                 swanlab_runner.log(global_step=global_step, step_log=step_log)
 
-        if (epoch % compute_action_mse_every) == 0 and rank == 0:
-            with torch.no_grad():
-                # -- compute action mse
-                clips, actions, states, extrinsics = load_clips(train_sampling_batch)
-                actions = actions.cpu().numpy().squeeze(0)
-                h = ac_world_model.encode(clips)
-                idx = 0
-                pred_actions = []
-                for idx in range(states.size(1)-1):
-                    pred_action = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
-                    pred_actions.append(pred_action)
-                pred_actions = np.concatenate(pred_actions, axis=0)
-                mse = np.mean((actions - pred_actions) ** 2)
+        # if (epoch % compute_action_mse_every) == 0:
+        #     with torch.no_grad():
+        #         # -- compute action mse
+        #         clips, actions, states, extrinsics, dp_torch_data = load_clips(train_sampling_batch, device)
+        #         actions = actions.cpu().numpy().squeeze(0)
+        #         h = ac_world_model.encode(clips)
+        #         idx = 0
+        #         pred_actions = []
+        #         for idx in range(states.size(1)-1):
+        #             pred_action = ac_world_model.infer_next_action(h[:,idx*tokens_per_frame:(idx+1)*tokens_per_frame], states[:, idx], h[:,(idx+1)*tokens_per_frame:(idx+2)*tokens_per_frame]).cpu().numpy()
+        #             pred_actions.append(pred_action)
+        #         pred_actions = np.concatenate(pred_actions, axis=0)
+        #         mse = np.mean((actions - pred_actions) ** 2)
                 
-                # plot left
-                title = f"Epoch{epoch}_left-action_mse:{mse:.4f}"
-                fig = plot_trajectory_comparison(
-                    gt_xyz=actions[:, :3],
-                    pred_xyz=pred_actions[:, :3],
-                    title=title,
-                )
-                filename = f"{title}.png"
-                output_folder = os.path.join(folder, "plots")
-                os.makedirs(output_folder, exist_ok=True)
-                fig.savefig(os.path.join(output_folder, filename))
+        #         # plot left
+        #         title = f"Epoch{epoch}_left-action_mse:{mse:.4f}"
+        #         fig = plot_trajectory_comparison(
+        #             gt_xyz=actions[:, :3],
+        #             pred_xyz=pred_actions[:, :3],
+        #             title=title,
+        #         )
+        #         filename = f"{title}.png"
+        #         output_folder = os.path.join(folder, "plots")
+        #         os.makedirs(output_folder, exist_ok=True)
+        #         fig.savefig(os.path.join(output_folder, filename))
 
-                # plot right
-                title = f"Epoch{epoch}_right-action_mse:{mse:.4f}"
-                fig = plot_trajectory_comparison(
-                    gt_xyz=actions[:, 4:7],
-                    pred_xyz=pred_actions[:, 4:7],
-                    title=title,
-                )
-                filename = f"{title}.png"
-                fig.savefig(os.path.join(output_folder, filename))
-                global_step = (epoch + 1) * ipe
-                swanlab_runner.log(global_step=global_step, step_log={"actions_mse": mse})
-                logger.info("avg. action mse %.3f" % mse)
+        #         # plot right
+        #         # title = f"Epoch{epoch}_right-action_mse:{mse:.4f}"
+        #         # fig = plot_trajectory_comparison(
+        #         #     gt_xyz=actions[:, 10:13],
+        #         #     pred_xyz=pred_actions[:, 10:13],
+        #         #     title=title,
+        #         # )
+        #         # filename = f"{title}.png"
+        #         # fig.savefig(os.path.join(output_folder, filename))
+        #         # global_step = (epoch + 1) * ipe
+        #         swanlab_runner.log(global_step=global_step, step_log={"actions_mse": mse})
+        #         logger.info("avg. action mse %.3f" % mse)
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
